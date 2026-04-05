@@ -1,0 +1,38 @@
+{
+  "name": "claude-max-proxy",
+  "version": "1.0.0",
+  "description": "Local proxy that routes Anthropic Messages API requests through Claude Code CLI, using your Max subscription's first-party auth instead of third-party API billing.",
+  "main": "index.js",
+  "bin": {
+    "claude-max-proxy": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "proxy",
+    "claude-max",
+    "openclaw",
+    "claude-code"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MovementBD/claude-max-proxy.git"
+  },
+  "homepage": "https://github.com/MovementBD/claude-max-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/MovementBD/claude-max-proxy/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
