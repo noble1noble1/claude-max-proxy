@@ -187,24 +187,58 @@ const SANITIZE_PATTERNS = [
 ];
 
 function sanitizeString(text) {
-  if (!text) return text;
+  if (typeof text !== 'string') return text;
   for (const [pattern, replacement] of SANITIZE_PATTERNS) {
     text = text.replace(pattern, replacement);
   }
   return text;
 }
 
-function sanitizeDeep(obj) {
-  if (typeof obj === 'string') return sanitizeString(obj);
-  if (Array.isArray(obj)) return obj.map(sanitizeDeep);
-  if (obj && typeof obj === 'object') {
-    const result = {};
-    for (const [key, value] of Object.entries(obj)) {
-      result[key] = sanitizeDeep(value);
-    }
-    return result;
+/**
+ * Sanitize only the fields Anthropic inspects for third-party detection:
+ * - system prompt (string or content blocks)
+ * - user message text (string or content blocks)
+ * Leaves tool definitions, tool results, assistant messages, and metadata untouched.
+ */
+function sanitizeRequest(body) {
+  if (!body || typeof body !== 'object') return body;
+  const result = { ...body };
+
+  // Sanitize system prompt
+  if (typeof result.system === 'string') {
+    result.system = sanitizeString(result.system);
+  } else if (Array.isArray(result.system)) {
+    result.system = result.system.map(block => {
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        return { ...block, text: sanitizeString(block.text) };
+      }
+      return block;
+    });
   }
-  return obj;
+
+  // Sanitize user message content only
+  if (Array.isArray(result.messages)) {
+    result.messages = result.messages.map(msg => {
+      if (msg.role !== 'user') return msg;
+      if (typeof msg.content === 'string') {
+        return { ...msg, content: sanitizeString(msg.content) };
+      }
+      if (Array.isArray(msg.content)) {
+        return {
+          ...msg,
+          content: msg.content.map(block => {
+            if (block?.type === 'text' && typeof block.text === 'string') {
+              return { ...block, text: sanitizeString(block.text) };
+            }
+            return block;
+          }),
+        };
+      }
+      return msg;
+    });
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +303,11 @@ function forwardRequest(req, res, body) {
       log('Auth error:', err.message);
       res.status(401).json({
         type: 'error',
-        error: { type: 'authentication_error', message: err.message },
+        error: {
+          type: 'proxy_auth_error',
+          message: err.message,
+          action: 'Run "claude auth login" to re-authenticate',
+        },
       });
       return resolve();
     }
@@ -351,7 +389,7 @@ app.use(express.json({ limit: '50mb' }));
 
 // POST /v1/messages — main proxy endpoint (sanitize + forward)
 app.post('/v1/messages', async (req, res) => {
-  const sanitizedBody = sanitizeDeep(req.body);
+  const sanitizedBody = sanitizeRequest(req.body);
 
   const model = sanitizedBody.model || '?';
   const stream = !!sanitizedBody.stream;
@@ -359,10 +397,46 @@ app.post('/v1/messages', async (req, res) => {
 
   log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount}`);
 
+  // Verify sanitization: only check fields we actually sanitize (system prompt + user text blocks)
+  const BLOCKED_TERMS = ['openclaw', 'open-claw', 'sillytavern', 'silly-tavern', 'typingmind', 'typing-mind'];
+  const sanitizedFields = [];
+  if (typeof sanitizedBody.system === 'string') {
+    sanitizedFields.push(sanitizedBody.system);
+  } else if (Array.isArray(sanitizedBody.system)) {
+    for (const b of sanitizedBody.system) {
+      if (b?.type === 'text') sanitizedFields.push(b.text);
+    }
+  }
+  for (const msg of sanitizedBody.messages || []) {
+    if (msg.role !== 'user') continue;
+    if (typeof msg.content === 'string') {
+      sanitizedFields.push(msg.content);
+    } else if (Array.isArray(msg.content)) {
+      for (const b of msg.content) {
+        if (b?.type === 'text') sanitizedFields.push(b.text);
+      }
+    }
+  }
+  const sanitizedText = sanitizedFields.join(' ').toLowerCase();
+  const leaks = BLOCKED_TERMS.filter(term => sanitizedText.includes(term));
+  if (leaks.length > 0) {
+    log(`⚠ SANITIZATION LEAK: found [${leaks.join(', ')}] in outgoing system/user content — blocking`);
+    res.status(400).json({
+      type: 'error',
+      error: {
+        type: 'sanitization_error',
+        message: `Blocked: outgoing request still contains identifiers: ${leaks.join(', ')}. This would be rejected by Anthropic.`,
+      },
+    });
+    return;
+  }
+
   if (DEBUG) {
     const fs = require('fs');
     fs.writeFileSync('/tmp/claude-proxy-last-request.json', JSON.stringify(req.body, null, 2));
-    debug('Full request saved to /tmp/claude-proxy-last-request.json');
+    fs.writeFileSync('/tmp/claude-proxy-sanitized-request.json', JSON.stringify(sanitizedBody, null, 2));
+    debug('Original request saved to /tmp/claude-proxy-last-request.json');
+    debug('Sanitized request saved to /tmp/claude-proxy-sanitized-request.json');
   }
 
   await forwardRequest(req, res, sanitizedBody);
@@ -389,13 +463,17 @@ app.get('/health', async (req, res) => {
     tokenStatus = 'error';
   }
 
+  const sub = cachedCredentials?.subscriptionType || 'unknown';
+  const isMax = sub === 'max';
+
   res.json({
-    status: 'ok',
+    status: isMax ? 'ok' : 'warning',
     version: require('./package.json').version,
     mode: 'oauth-proxy',
     token: tokenStatus,
-    subscription: cachedCredentials?.subscriptionType || 'unknown',
+    subscription: sub,
     rateLimitTier: cachedCredentials?.rateLimitTier || 'unknown',
+    ...(isMax ? {} : { warning: 'Not a Max subscription — requests will be billed as standard API usage' }),
   });
 });
 
