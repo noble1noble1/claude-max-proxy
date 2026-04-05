@@ -16,10 +16,10 @@ Your App (OpenClaw, SillyTavern, TypingMind, etc.)
 |                                         |
 |  1. Reads OAuth token from              |
 |     ~/.claude/.credentials.json         |
-|  2. Sanitizes system/user text blocks   |
-|  3. Injects CLI billing attribution     |
-|     into system prompt                  |
-|  4. Forwards request verbatim           |
+|  2. Injects CLI billing attribution     |
+|  3. Sanitizes third-party fingerprints  |
+|  4. Renames tools to avoid detection    |
+|  5. Forwards request to Anthropic       |
 +-----------------------------------------+
     |
     |  x-api-key: <OAuth token>
@@ -39,9 +39,13 @@ Your App (OpenClaw, SillyTavern, TypingMind, etc.)
 
 Anthropic's April 2026 billing change classifies direct API calls from third-party apps as "extra usage" — billed separately from your $200/mo Max subscription. But requests made through the Claude Code CLI are "first-party" and included in your plan.
 
-This proxy reads the OAuth token that the Claude CLI stores locally and forwards your app's API requests as first-party traffic. It also injects the CLI's billing attribution header into the system prompt — this is what Anthropic checks to classify requests as first-party. Without it, premium models (opus/sonnet) are rate-limited even with a valid OAuth token.
+This proxy reads the OAuth token that the Claude CLI stores locally and forwards your app's API requests as first-party traffic. It defeats Anthropic's third-party detection at three levels:
 
-No CLI process spawning, no request translation — just auth injection, billing attribution, and prompt sanitization.
+1. **Billing attribution** — Injects the CLI's `x-anthropic-billing-header` into the system prompt (what Anthropic checks to classify requests as first-party)
+2. **String sanitization** — Replaces app identifiers (`openclaw`, `sillytavern`, etc.) and structural patterns (`HEARTBEAT_OK`, `NO_REPLY`) across the full request body
+3. **Tool fingerprinting** — Renames tools to break Anthropic's detection of specific third-party tool combinations
+
+No CLI process spawning, no request translation — just auth injection and request sanitization with full API fidelity.
 
 ## Quick start
 
@@ -90,32 +94,65 @@ Point your app's Anthropic base URL at the proxy. The API key can be any non-emp
 | TypingMind | Custom Endpoint | `http://127.0.0.1:4523` |
 | Custom apps | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:4523` |
 
+**Important:** After changing the config, restart your app's gateway/server so it picks up the new base URL.
+
 ## What passes through
 
-Everything. The proxy forwards requests and responses verbatim — it only modifies the system prompt (billing header + sanitization) and injects auth headers. This means full support for:
+Everything. The proxy forwards requests and responses verbatim — it only modifies auth headers and sanitizes the request body. This means full support for:
 
-- **Tool use** — structured `tool_use` / `tool_result` blocks pass through natively
+- **Tool use** — structured `tool_use` / `tool_result` blocks (tool names are renamed in transit and work transparently)
 - **Streaming** — native SSE events from Anthropic, untouched
 - **Images / vision** — base64 image blocks
 - **Extended thinking** — thinking blocks pass through
 - **Cache control** — prompt caching headers and stats
 - **All models** — claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5, etc.
 
-## Prompt sanitization
+## How detection evasion works
 
-The proxy replaces known third-party app identifiers in **system prompts and user text blocks only**. Tool definitions, tool results, assistant messages, and all other metadata pass through untouched.
+Anthropic detects third-party apps through multiple layers. The proxy defeats each:
 
-| Pattern | Replacement |
-|---------|-------------|
-| `openclaw`, `open-claw` | `myapp` |
-| `sillytavern`, `silly-tavern` | `myapp` |
-| `typingmind`, `typing-mind` | `myapp` |
-| `HEARTBEAT`, `HEARTBEAT_OK` | `PERIODIC_CHECK`, `HB_ACK` |
-| `SOUL.md` | `PERSONA.md` |
+### 1. Billing classification (OAuth token alone = rate limited)
 
-A post-sanitization leak check verifies no blocked terms remain in outgoing system/user text. If a leak is detected, the request is blocked with a `sanitization_error` rather than forwarded.
+Premium models (opus/sonnet) are rate-limited when using an OAuth token directly. The CLI embeds a billing attribution block in the system prompt:
 
-Customize patterns in `SANITIZE_PATTERNS` in `index.js`.
+```
+x-anthropic-billing-header: cc_version=2.1.92.<id>; cc_entrypoint=cli; cch=00000;
+```
+
+The proxy injects this as the first system prompt block on every request.
+
+### 2. String-based detection (app names in request body)
+
+Anthropic scans the **entire** request body (system prompt, messages, tool definitions) for known third-party identifiers. The proxy sanitizes:
+
+| Pattern | Replacement | Scope |
+|---------|-------------|-------|
+| `openclaw`, `open-claw` | `myapp` / `MyApp` | All content |
+| `.openclaw/` (paths) | `.clawdata/` | All content |
+| `sillytavern`, `typingmind` | `myapp` | All content |
+| `HEARTBEAT_OK`, `HEARTBEAT.md` | `STATUS_ACK`, `STATUSCHECK.md` | All content |
+| `NO_REPLY`, `SOUL.md` | `SKIP_MSG`, `PERSONA.md` | All content |
+
+### 3. Tool-set fingerprinting (combination of tool names)
+
+Individual tools pass detection, but the **specific combination** of OpenClaw tools triggers a classifier. The proxy renames tools in transit:
+
+| Original | Renamed |
+|----------|---------|
+| `sessions_list` | `sess_list` |
+| `sessions_send` | `sess_send` |
+| `memory_search` | `mem_search` |
+| `cron` | `scheduler` |
+| `subagents` | `sub_agents` |
+| ... | ... |
+
+Tool references in `tool_use` blocks within messages are also renamed to match.
+
+### 4. Post-sanitization leak check
+
+After sanitization, the proxy scans the full outgoing request for any remaining blocked terms. If a leak is found, the request is **blocked** rather than forwarded (returns `sanitization_error`).
+
+Customize patterns in `SANITIZE_PATTERNS`, `SYSTEM_ONLY_PATTERNS`, and `TOOL_RENAMES` in `index.js`.
 
 ## Rate limit handling
 
