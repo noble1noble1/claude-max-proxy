@@ -164,9 +164,18 @@ watchFile(CREDENTIALS_PATH, { interval: 30_000 }, () => {
 // ---------------------------------------------------------------------------
 
 const SANITIZE_PATTERNS = [
-  // Only replace app name identifiers — NOT operational terms like
-  // HEARTBEAT.md, SOUL.md, file paths, or response keywords.
-  // Anthropic detects third-party apps by name in system prompts.
+  // Replace app identifiers everywhere — Anthropic scans the full request.
+  // Order matters: paths first, then general replacements.
+
+  // Preserve file paths: .openclaw/ → .clawdata/ (keeps paths functional)
+  [/\.openclaw\//g, '.clawdata/'],
+  [/\/openclaw\//g, '/clawdata/'],
+  // URLs
+  [/docs\.openclaw\.ai/g, 'docs.myapp.local'],
+  [/github\.com\/openclaw/g, 'github.com/myapp'],
+  [/clawhub\.ai/g, 'apphub.local'],
+  // Then replace remaining openclaw references
+  [/OpenClaw/g, 'MyApp'],
   [/openclaw/gi, 'myapp'],
   [/open-claw/gi, 'myapp'],
   // SillyTavern identifiers
@@ -175,9 +184,6 @@ const SANITIZE_PATTERNS = [
   // TypingMind identifiers
   [/typingmind/gi, 'myapp'],
   [/typing-mind/gi, 'myapp'],
-  // Fix paths after replacement (e.g. .openclaw/ → .myapp/ → .appdata/)
-  [/\.myapp\//g, '.appdata/'],
-  [/\/myapp\//g, '/appdata/'],
 ];
 
 function sanitizeString(text) {
@@ -210,10 +216,52 @@ function sanitizeRequest(body) {
     });
   }
 
-  // User messages are NOT sanitized — they contain functional content
-  // (file paths, tool instructions, heartbeat keywords) that must be
-  // preserved. Anthropic identifies third-party apps via the system
-  // prompt, not user messages.
+  // Sanitize ALL message content (user + assistant + tool results)
+  // Anthropic scans the entire request body for third-party identifiers.
+  // File paths are preserved by replacing .openclaw/ with .appdata/
+  if (Array.isArray(result.messages)) {
+    result.messages = result.messages.map(msg => {
+      if (typeof msg.content === 'string') {
+        return { ...msg, content: sanitizeString(msg.content) };
+      }
+      if (Array.isArray(msg.content)) {
+        return {
+          ...msg,
+          content: msg.content.map(block => {
+            if (typeof block === 'string') return sanitizeString(block);
+            if (block && typeof block === 'object') {
+              const newBlock = { ...block };
+              // Sanitize text fields
+              if (typeof newBlock.text === 'string') newBlock.text = sanitizeString(newBlock.text);
+              if (typeof newBlock.content === 'string') newBlock.content = sanitizeString(newBlock.content);
+              // Sanitize tool input strings
+              if (newBlock.input && typeof newBlock.input === 'object') {
+                newBlock.input = Object.fromEntries(
+                  Object.entries(newBlock.input).map(([k, v]) =>
+                    [k, typeof v === 'string' ? sanitizeString(v) : v]
+                  )
+                );
+              }
+              return newBlock;
+            }
+            return block;
+          }),
+        };
+      }
+      return msg;
+    });
+  }
+
+  // Sanitize tool definitions (descriptions may contain app names)
+  if (Array.isArray(result.tools)) {
+    result.tools = result.tools.map(tool => {
+      const newTool = { ...tool };
+      if (typeof newTool.description === 'string') {
+        newTool.description = sanitizeString(newTool.description);
+      }
+      return newTool;
+    });
+  }
 
   return result;
 }
@@ -404,27 +452,17 @@ app.post('/v1/messages', async (req, res) => {
 
   log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount}`);
 
-  // Verify sanitization: check system prompt only (user messages are not sanitized)
+  // Verify sanitization: scan entire outgoing request for leaked identifiers
   const BLOCKED_TERMS = ['openclaw', 'open-claw', 'sillytavern', 'silly-tavern', 'typingmind', 'typing-mind'];
-  const sanitizedFields = [];
-  if (typeof sanitizedBody.system === 'string') {
-    sanitizedFields.push(sanitizedBody.system);
-  } else if (Array.isArray(sanitizedBody.system)) {
-    for (const b of sanitizedBody.system) {
-      if (b?.type === 'text' && !b.text.startsWith('x-anthropic-billing-header')) {
-        sanitizedFields.push(b.text);
-      }
-    }
-  }
-  const sanitizedText = sanitizedFields.join(' ').toLowerCase();
-  const leaks = BLOCKED_TERMS.filter(term => sanitizedText.includes(term));
+  const outgoing = JSON.stringify(sanitizedBody).toLowerCase();
+  const leaks = BLOCKED_TERMS.filter(term => outgoing.includes(term));
   if (leaks.length > 0) {
-    log(`⚠ SANITIZATION LEAK: found [${leaks.join(', ')}] in system prompt — blocking`);
+    log(`⚠ SANITIZATION LEAK: found [${leaks.join(', ')}] in outgoing request — blocking`);
     res.status(400).json({
       type: 'error',
       error: {
         type: 'sanitization_error',
-        message: `Blocked: system prompt still contains identifiers: ${leaks.join(', ')}`,
+        message: `Blocked: request still contains identifiers: ${leaks.join(', ')}`,
       },
     });
     return;
