@@ -1,99 +1,80 @@
 # claude-max-proxy
 
-Local proxy that routes Anthropic Messages API requests through the Claude Code CLI, so third-party apps use your Max subscription instead of extra-usage billing.
+Thin OAuth proxy that forwards Anthropic Messages API requests using your Claude Code CLI credentials. Your apps get full API fidelity (tool use, streaming, images) billed as first-party Max subscription usage.
 
-## Architecture
+## How it works
 
 ```
 Your App (OpenClaw, SillyTavern, TypingMind, etc.)
     |
-    |  Anthropic Messages API
+    |  Standard Anthropic Messages API
     |  POST /v1/messages
     v
-+--------------------------+
-|   claude-max-proxy       |
-|   localhost:4523         |
-|                          |
-|  * Receives API request  |
-|  * Sanitizes prompt      |
-|  * Spawns claude -p      |
-+------------+-------------+
-             |
-             |  Claude Code CLI
-             |  (first-party auth)
-             v
-+--------------------------+
-|   Anthropic API          |
-|                          |
-|  Billed as first-party   |
-|  + Uses Max plan limits  |
-|  - NOT extra usage       |
-+--------------------------+
++---------------------------------+
+|   claude-max-proxy              |
+|   localhost:4523                |
+|                                 |
+|  1. Reads OAuth token from      |
+|     ~/.claude/.credentials.json |
+|  2. Sanitizes prompt            |
+|  3. Forwards request verbatim   |
++---------------------------------+
+    |
+    |  x-api-key: <OAuth token>
+    |  anthropic-client-platform: cli
+    v
++---------------------------------+
+|   api.anthropic.com             |
+|                                 |
+|  Billed as first-party          |
+|  Uses Max plan limits           |
+|  NOT extra usage                |
++---------------------------------+
 ```
 
-## Why does this exist?
+## Why?
 
-In April 2026, Anthropic changed how billing works for Claude Max subscribers. Direct API calls made by third-party applications (OpenClaw, SillyTavern, TypingMind, and others) are now classified as "third-party usage" and billed separately from your $200/month Max subscription. Anthropic detects third-party app identifiers in prompts and routes those requests to extra-usage billing.
+Anthropic's April 2026 billing change classifies direct API calls from third-party apps as "extra usage" — billed separately from your $200/mo Max subscription. But requests that go through the Claude Code CLI are "first-party" and included in your plan.
 
-However, requests made through the official Claude Code CLI (`claude -p`) are treated as **first-party usage** and count against your normal Max plan limits -- no extra charges.
-
-**claude-max-proxy** bridges this gap. It accepts standard Anthropic Messages API requests from any app, sanitizes known third-party identifiers from the prompt, and forwards the request through `claude -p`. Your app talks to the proxy exactly like it would talk to the Anthropic API, but the actual inference is routed through the CLI and billed as first-party usage.
+This proxy reads the OAuth token that the Claude CLI stores locally and uses it to forward your app's API requests as first-party traffic. No CLI process spawning, no request translation — just auth injection and prompt sanitization.
 
 ## Quick start
 
 ### Prerequisites
 
-- **Node.js** 18 or later
-- **Claude Code CLI** installed and authenticated (`claude` must be on your PATH)
-- An active **Claude Max** subscription
+- **Node.js** 18+
+- **Claude Code CLI** installed and authenticated (`claude auth login`)
+- Active **Claude Max** subscription
 
-### Installation
+### Install & run
 
 ```bash
 git clone https://github.com/wiziswiz/claude-max-proxy.git
 cd claude-max-proxy
 npm install
-```
-
-### Run
-
-```bash
 node index.js
 ```
-
-The proxy starts on `http://127.0.0.1:4523` by default.
 
 ### Verify
 
 ```bash
 curl http://localhost:4523/health
-# {"status":"ok","version":"1.0.0"}
 ```
-
-## Configuration
-
-### Pointing OpenClaw at the proxy
-
-In your OpenClaw configuration, set the Anthropic provider to use the proxy as its base URL. For example, in your `models.providers` config:
 
 ```json
 {
-  "providers": {
-    "anthropic": {
-      "baseUrl": "http://127.0.0.1:4523",
-      "apiKey": "not-needed"
-    }
-  }
+  "status": "ok",
+  "version": "2.0.0",
+  "mode": "oauth-proxy",
+  "token": "valid",
+  "subscription": "max",
+  "rateLimitTier": "default_claude_max_20x"
 }
 ```
 
-The API key can be any non-empty string -- authentication is handled by the Claude Code CLI, not by the proxy.
+## App configuration
 
-If you have previously configured an Anthropic API key or auth profile in OpenClaw, clear it so requests are routed through the proxy instead of directly to Anthropic.
-
-### Any Anthropic Messages API client
-
-This proxy works with **any** application that speaks the Anthropic Messages API. Point the app's base URL at the proxy and provide a dummy API key:
+Point your app's Anthropic base URL at the proxy. The API key can be any non-empty string — auth is handled by the proxy.
 
 | App | Setting | Value |
 |-----|---------|-------|
@@ -102,33 +83,63 @@ This proxy works with **any** application that speaks the Anthropic Messages API
 | TypingMind | Custom Endpoint | `http://127.0.0.1:4523` |
 | Custom apps | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:4523` |
 
+## What passes through
+
+Everything. The proxy forwards requests and responses verbatim — it only modifies auth headers and sanitizes prompt strings. This means full support for:
+
+- **Tool use** — structured `tool_use` / `tool_result` blocks
+- **Streaming** — native SSE events from Anthropic
+- **Images / vision** — base64 image blocks
+- **Extended thinking** — thinking blocks pass through
+- **Cache control** — prompt caching headers and stats
+- **All models** — claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5, etc.
+
+## Prompt sanitization
+
+The proxy replaces known third-party app identifiers to avoid extra-usage billing triggers:
+
+| Pattern | Replacement |
+|---------|-------------|
+| `openclaw`, `open-claw` | `myapp` |
+| `sillytavern`, `silly-tavern` | `myapp` |
+| `typingmind`, `typing-mind` | `myapp` |
+| `HEARTBEAT`, `HEARTBEAT_OK` | `PERIODIC_CHECK`, `HB_ACK` |
+| `SOUL.md` | `PERSONA.md` |
+
+Customize patterns in `SANITIZE_PATTERNS` in `index.js`.
+
+## Token management
+
+The proxy reads OAuth credentials from `~/.claude/.credentials.json` (written by the Claude CLI). Tokens auto-refresh:
+
+- Token validity is checked on each request
+- Refreshes 5 minutes before expiry (same as CLI)
+- Refresh uses Anthropic's OAuth endpoint with the stored refresh token
+- Updated credentials are written back to the file
+- File is watched for external changes (e.g., CLI refreshes token independently)
+
+If the token is missing or invalid, run `claude auth login` to re-authenticate.
+
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `4523` | Port the proxy listens on |
-| `DEBUG` | `false` | Set to `1` or `true` to enable verbose logging. Dumps full requests to `/tmp/claude-proxy-last-request.json`. |
-| `CLAUDE_PATH` | `claude` | Path to the Claude Code CLI binary, if not on your PATH |
+| `DEBUG` | `false` | Set to `1` for verbose logging |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic API endpoint |
+| `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials |
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming) |
-| `GET` | `/v1/models` | Lists available models |
-| `GET` | `/health` | Health check |
+| `GET` | `/v1/models` | Forwards to Anthropic's model list |
+| `GET` | `/health` | Health check with token status |
 
-## Model mapping
+## Running as a service
 
-The proxy maps full Anthropic model names to Claude Code CLI model shortnames:
-
-| API model name | CLI shortname |
-|----------------|---------------|
-| `claude-opus-4-6`, `claude-opus-4-5`, `claude-opus-4-1`, `claude-opus-4-0` | `opus` |
-| `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-sonnet-4-0` | `sonnet` |
-| `claude-haiku-4-5` | `haiku` |
-
-## Running as a macOS launchd service
+### macOS (launchd)
 
 Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
 
@@ -140,13 +151,13 @@ Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
 <dict>
     <key>Label</key>
     <string>com.claude-max-proxy</string>
-
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/node</string>
         <string>/Users/YOUR_USER/claude-max-proxy/index.js</string>
     </array>
-
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/claude-max-proxy</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PORT</key>
@@ -154,12 +165,10 @@ Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
     </dict>
-
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
-
     <key>StandardOutPath</key>
     <string>/tmp/claude-max-proxy.log</string>
     <key>StandardErrorPath</key>
@@ -168,19 +177,11 @@ Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
 </plist>
 ```
 
-Load and start:
-
 ```bash
 launchctl load ~/Library/LaunchAgents/com.claude-max-proxy.plist
 ```
 
-Stop and unload:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.claude-max-proxy.plist
-```
-
-## Running as a Linux systemd service
+### Linux (systemd)
 
 Create `/etc/systemd/system/claude-max-proxy.service`:
 
@@ -197,54 +198,23 @@ ExecStart=/usr/bin/node /home/YOUR_USER/claude-max-proxy/index.js
 Restart=on-failure
 RestartSec=5
 Environment=PORT=4523
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable and start:
-
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable claude-max-proxy
-sudo systemctl start claude-max-proxy
+sudo systemctl enable --now claude-max-proxy
 ```
 
-Check status and logs:
+## Security
 
-```bash
-sudo systemctl status claude-max-proxy
-journalctl -u claude-max-proxy -f
-```
-
-## Limitations (proxy vs direct API)
-
-This proxy gets the job done, but there are trade-offs compared to a direct Anthropic API connection:
-
-| Feature | Direct API (OAuth tokens) | claude-max-proxy |
-|---------|--------------------------|------------------|
-| **Billing** | Extra usage ($$) | Max plan (flat $200/mo) |
-| **Multi-turn sessions** | Stateless per-request (app manages history) | Same -- app sends full history each request |
-| **Streaming** | Native SSE | Supported (translated from CLI output) |
-| **Tool use (`tool_use` blocks)** | Native structured blocks | Serialized into text prompt -- model may respond with tool-call text but not structured JSON |
-| **Latency** | Direct HTTP to API | ~1-3s overhead per request (CLI process spawn) |
-| **Concurrency** | Limited by rate tier | Each request spawns a separate CLI process |
-| **Images / vision** | Supported via base64 | Not supported (image blocks are dropped) |
-| **Prompt fidelity** | Exact pass-through | Third-party identifiers are sanitized (replaced with generic terms) |
-| **System prompt** | Exact pass-through | Custom system prompt overrides CLI defaults |
-
-### Key limitations in detail
-
-- **Single-turn per process.** Each request spawns a fresh `claude -p` process with no session persistence. Your app must send the full conversation history in every request (most apps already do this).
-- **No native tool_use pass-through.** Tool definitions are serialized into the system prompt as text. The model may still respond with tool-call-like text, but it won't be structured `tool_use` content blocks.
-- **Prompt sanitization.** The proxy replaces known third-party app identifiers (e.g., "OpenClaw", "SillyTavern") with generic placeholders to avoid triggering extra-usage billing. This may occasionally alter prompt content in unexpected ways. You can customize the patterns in `SANITIZE_PATTERNS` in `index.js`.
-- **Startup latency.** Each request spawns a new Node.js process for the CLI, adding 1-3 seconds of overhead.
-- **Localhost only.** The proxy binds to `127.0.0.1` by default. It is not designed to be exposed to the public internet.
+- Binds to `127.0.0.1` only — not exposed to the network
+- Credentials file is read with owner-only permissions (`600`)
+- No API keys are logged (even in debug mode)
+- Do not expose this proxy to the public internet
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
