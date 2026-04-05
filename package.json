@@ -1,7 +1,7 @@
 {
   "name": "claude-max-proxy",
-  "version": "1.0.0",
-  "description": "Local proxy that routes Anthropic Messages API requests through Claude Code CLI, using your Max subscription's first-party auth instead of third-party API billing.",
+  "version": "2.0.0",
+  "description": "Thin OAuth proxy that injects Claude CLI credentials into Anthropic API requests, routing them as first-party Max subscription usage.",
   "main": "index.js",
   "bin": {
     "claude-max-proxy": "./index.js"

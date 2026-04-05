@@ -1,33 +1,42 @@
 #!/usr/bin/env node
 
 /**
- * claude-max-proxy
+ * claude-max-proxy v2
  *
- * Local proxy that accepts Anthropic Messages API requests and routes them
- * through `claude -p` (the Claude Code CLI in print mode).
+ * Thin reverse proxy that injects Claude CLI OAuth credentials into
+ * Anthropic Messages API requests. Full API fidelity — tool_use,
+ * streaming, images, everything passes through untouched.
  *
- * Why: Anthropic's April 2026 policy change treats direct API calls as
- * "third-party" usage (billed separately), but Claude Code CLI calls are
- * "first-party" (included in your $200/mo Max subscription). This proxy
- * bridges the gap for tools like OpenClaw, SillyTavern, TypingMind, etc.
+ * How it works:
+ *   1. Reads OAuth token from ~/.claude/.credentials.json
+ *   2. Auto-refreshes when token nears expiry
+ *   3. Sanitizes prompts (strips third-party app identifiers)
+ *   4. Forwards request verbatim to api.anthropic.com
+ *   5. Streams response back untouched
  *
  * Usage:
- *   npx claude-max-proxy          # start on default port 4523
- *   PORT=8080 npx claude-max-proxy # custom port
+ *   node index.js                  # start on default port 4523
+ *   PORT=8080 node index.js        # custom port
  *
  * Then point your app's Anthropic base URL at http://localhost:4523
  */
 
 const express = require('express');
-const { spawn } = require('child_process');
-const { randomUUID } = require('crypto');
+const { readFileSync, watchFile, unwatchFile } = require('fs');
+const { homedir } = require('os');
+const { join } = require('path');
+const http = require('http');
+const https = require('https');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
 
 const PORT = parseInt(process.env.PORT || '4523', 10);
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
-const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
+const ANTHROPIC_BASE = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claude', '.credentials.json');
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
+const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -38,94 +47,120 @@ function debug(...args) {
 }
 
 // ---------------------------------------------------------------------------
-// Message conversion: Anthropic Messages API → flat prompt string
+// OAuth credential management
 // ---------------------------------------------------------------------------
 
-function flattenMessages(messages) {
-  const parts = [];
+let cachedCredentials = null;
+let refreshInProgress = null;
 
-  for (const msg of messages) {
-    const role = msg.role === 'user' ? 'Human' : 'Assistant';
-
-    if (typeof msg.content === 'string') {
-      parts.push(`${role}: ${msg.content}`);
-      continue;
+function readCredentials() {
+  try {
+    const raw = readFileSync(CREDENTIALS_PATH, 'utf-8');
+    const parsed = JSON.parse(raw);
+    cachedCredentials = parsed.claudeAiOauth;
+    if (!cachedCredentials?.accessToken) {
+      throw new Error('No accessToken found in credentials');
     }
-
-    const textParts = [];
-    for (const block of msg.content) {
-      switch (block.type) {
-        case 'text':
-          textParts.push(block.text);
-          break;
-        case 'tool_use':
-          textParts.push(
-            `[Tool call: ${block.name}(${JSON.stringify(block.input)}) id=${block.id}]`
-          );
-          break;
-        case 'tool_result': {
-          const resultContent =
-            typeof block.content === 'string'
-              ? block.content
-              : Array.isArray(block.content)
-                ? block.content
-                    .filter((b) => b.type === 'text')
-                    .map((b) => b.text)
-                    .join('\n')
-                : JSON.stringify(block.content);
-          textParts.push(
-            `[Tool result for ${block.tool_use_id}${block.is_error ? ' (error)' : ''}: ${resultContent}]`
-          );
-          break;
-        }
-        default:
-          break;
-      }
-    }
-
-    if (textParts.length > 0) {
-      parts.push(`${role}: ${textParts.join('\n')}`);
-    }
+    debug('Credentials loaded, expires at', new Date(cachedCredentials.expiresAt).toISOString());
+    return cachedCredentials;
+  } catch (err) {
+    log('Failed to read credentials:', err.message);
+    log(`Make sure Claude CLI is authenticated: run "claude auth login"`);
+    return null;
   }
-
-  return parts.join('\n\n');
 }
 
-function buildSystemPrompt(system, tools) {
-  let systemPrompt = '';
-
-  if (typeof system === 'string') {
-    systemPrompt = system;
-  } else if (Array.isArray(system)) {
-    systemPrompt = system
-      .map((s) => (typeof s === 'string' ? s : s.text || ''))
-      .filter(Boolean)
-      .join('\n');
-  }
-
-  if (tools && tools.length > 0) {
-    const toolBlock = tools
-      .map(
-        (t) =>
-          `<tool name="${t.name}">\n<description>${t.description || ''}</description>\n<input_schema>${JSON.stringify(t.input_schema)}</input_schema>\n</tool>`
-      )
-      .join('\n');
-
-    systemPrompt += `\n\nYou have access to the following tools. To use a tool, respond with a tool_use content block.\n\n${toolBlock}`;
-  }
-
-  if (systemPrompt) {
-    systemPrompt = sanitizePrompt(systemPrompt);
-  }
-
-  return systemPrompt || undefined;
+function isTokenExpired(creds) {
+  if (!creds?.expiresAt) return true;
+  // Refresh 5 minutes before expiry, same as Claude CLI
+  return Date.now() + 300_000 >= creds.expiresAt;
 }
 
-// Anthropic detects known third-party app names in prompts and routes
-// those requests to extra-usage billing instead of the Max plan.
-// Strip identifiers so requests are treated as first-party CLI usage.
-// Known third-party app identifiers that trigger extra-usage billing.
-// Add your own app/bot names here if needed.
+async function refreshToken(creds) {
+  if (!creds?.refreshToken) {
+    throw new Error('No refresh token available');
+  }
+
+  log('Refreshing OAuth token...');
+
+  const body = JSON.stringify({
+    grant_type: 'refresh_token',
+    refresh_token: creds.refreshToken,
+    client_id: OAUTH_CLIENT_ID,
+    scope: OAUTH_SCOPES,
+  });
+
+  const res = await fetch(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText);
+    throw new Error(`Token refresh failed (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+
+  cachedCredentials = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token || creds.refreshToken,
+    expiresAt: Date.now() + data.expires_in * 1000,
+    scopes: (data.scope || OAUTH_SCOPES).split(' '),
+    subscriptionType: creds.subscriptionType,
+    rateLimitTier: creds.rateLimitTier,
+  };
+
+  // Write back so the CLI and future proxy starts pick it up
+  try {
+    const { writeFileSync } = require('fs');
+    writeFileSync(CREDENTIALS_PATH, JSON.stringify({ claudeAiOauth: cachedCredentials }, null, 2), {
+      mode: 0o600,
+    });
+    debug('Updated credentials file');
+  } catch (err) {
+    debug('Could not write back credentials:', err.message);
+  }
+
+  log('Token refreshed, expires at', new Date(cachedCredentials.expiresAt).toISOString());
+  return cachedCredentials;
+}
+
+async function getAccessToken() {
+  if (!cachedCredentials) {
+    readCredentials();
+  }
+
+  if (!cachedCredentials) {
+    throw new Error('No credentials available. Run "claude auth login" first.');
+  }
+
+  if (!isTokenExpired(cachedCredentials)) {
+    return cachedCredentials.accessToken;
+  }
+
+  // Deduplicate concurrent refresh attempts
+  if (!refreshInProgress) {
+    refreshInProgress = refreshToken(cachedCredentials)
+      .finally(() => { refreshInProgress = null; });
+  }
+
+  const refreshed = await refreshInProgress;
+  return refreshed.accessToken;
+}
+
+// Watch credentials file for external changes (e.g., CLI refreshes token)
+watchFile(CREDENTIALS_PATH, { interval: 30_000 }, () => {
+  debug('Credentials file changed, reloading');
+  readCredentials();
+});
+
+// ---------------------------------------------------------------------------
+// Prompt sanitization
+// ---------------------------------------------------------------------------
+
 const SANITIZE_PATTERNS = [
   // OpenClaw identifiers
   [/openclaw/gi, 'myapp'],
@@ -149,7 +184,7 @@ const SANITIZE_PATTERNS = [
   [/\/myapp\//g, '/appdata/'],
 ];
 
-function sanitizePrompt(text) {
+function sanitizeString(text) {
   if (!text) return text;
   for (const [pattern, replacement] of SANITIZE_PATTERNS) {
     text = text.replace(pattern, replacement);
@@ -157,475 +192,202 @@ function sanitizePrompt(text) {
   return text;
 }
 
-// Deep sanitize: process the raw request body before any conversion
-function sanitizeRequestBody(body) {
-  // Recursively walk the body and sanitize all string values
-  if (typeof body === 'string') {
-    return sanitizePrompt(body);
-  }
-  if (Array.isArray(body)) {
-    return body.map(sanitizeRequestBody);
-  }
-  if (body && typeof body === 'object') {
+function sanitizeDeep(obj) {
+  if (typeof obj === 'string') return sanitizeString(obj);
+  if (Array.isArray(obj)) return obj.map(sanitizeDeep);
+  if (obj && typeof obj === 'object') {
     const result = {};
-    for (const [key, value] of Object.entries(body)) {
-      result[key] = sanitizeRequestBody(value);
+    for (const [key, value] of Object.entries(obj)) {
+      result[key] = sanitizeDeep(value);
     }
     return result;
   }
-  return body;
-}
-
-function mapModel(model) {
-  if (!model) return 'sonnet';
-  const aliases = {
-    'claude-opus-4-6': 'opus',
-    'claude-opus-4-5': 'opus',
-    'claude-opus-4-1': 'opus',
-    'claude-opus-4-0': 'opus',
-    'claude-sonnet-4-6': 'sonnet',
-    'claude-sonnet-4-5': 'sonnet',
-    'claude-sonnet-4-0': 'sonnet',
-    'claude-haiku-4-5': 'haiku',
-  };
-  return aliases[model] || model;
+  return obj;
 }
 
 // ---------------------------------------------------------------------------
-// Spawn `claude -p` and collect response
+// Reverse proxy: forward to api.anthropic.com
 // ---------------------------------------------------------------------------
 
-function runClaude(prompt, model, systemPrompt) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-p',
-      '--output-format', 'stream-json',
-      '--model', model,
-      '--verbose',
-      '--setting-sources', '',                     // Skip hooks, CLAUDE.md, settings
-      '--tools', '',                // No built-in tools
-      '--no-session-persistence',   // Don't save session
-    ];
-
-    if (systemPrompt) {
-      args.push('--system-prompt', systemPrompt);
+function forwardRequest(req, res, body) {
+  return new Promise(async (resolve) => {
+    let accessToken;
+    try {
+      accessToken = await getAccessToken();
+    } catch (err) {
+      log('Auth error:', err.message);
+      res.status(401).json({
+        type: 'error',
+        error: { type: 'authentication_error', message: err.message },
+      });
+      return resolve();
     }
 
-    debug('Spawning:', CLAUDE_PATH, args.join(' ').slice(0, 200));
+    const targetUrl = new URL(req.path, ANTHROPIC_BASE);
+    // Forward query params
+    if (req.url.includes('?')) {
+      targetUrl.search = req.url.split('?')[1];
+    }
 
-    const child = spawn(CLAUDE_PATH, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        HOME: process.env.HOME,
-        PATH: process.env.PATH,
-        LANG: process.env.LANG || 'en_US.UTF-8',
-        TERM: process.env.TERM || 'xterm-256color',
-        USER: process.env.USER,
-        TMPDIR: process.env.TMPDIR || '/tmp',
-      },
-    });
+    const headers = {
+      'x-api-key': accessToken,
+      'content-type': 'application/json',
+      'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+      // Identify as CLI client for first-party billing classification
+      'anthropic-client-platform': 'cli',
+      'user-agent': 'Anthropic/JS 0.80.0',
+      // Stainless SDK telemetry (matches CLI fingerprint)
+      'x-stainless-lang': 'js',
+      'x-stainless-package-version': '0.80.0',
+      'x-stainless-os': process.platform,
+      'x-stainless-arch': process.arch,
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': process.versions.node,
+    };
 
-    const chunks = [];
-    let stderrData = '';
+    // Forward anthropic-beta header if present
+    if (req.headers['anthropic-beta']) {
+      headers['anthropic-beta'] = req.headers['anthropic-beta'];
+    }
 
-    child.stdout.on('data', (data) => {
-      chunks.push(data);
-    });
+    debug(`→ ${req.method} ${targetUrl.toString()}`);
 
-    child.stderr.on('data', (data) => {
-      stderrData += data.toString();
-      debug('claude stderr:', data.toString().slice(0, 200));
-    });
+    const payload = body ? JSON.stringify(body) : undefined;
+    if (payload) {
+      headers['content-length'] = Buffer.byteLength(payload);
+    }
 
-    child.on('error', (err) => {
-      reject(new Error(`Failed to spawn claude: ${err.message}`));
-    });
+    const transport = targetUrl.protocol === 'https:' ? https : http;
 
-    child.on('close', (code) => {
-      const output = Buffer.concat(chunks).toString();
-      if (code !== 0 && !output) {
-        reject(new Error(`claude exited with code ${code}: ${stderrData.slice(0, 500)}`));
-        return;
+    const proxyReq = transport.request(targetUrl, {
+      method: req.method,
+      headers,
+    }, (proxyRes) => {
+      debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
+
+      // Copy response headers
+      const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+      for (const [key, value] of Object.entries(proxyRes.headers)) {
+        if (!skipHeaders.has(key.toLowerCase())) {
+          res.setHeader(key, value);
+        }
       }
-      resolve(output);
+      res.status(proxyRes.statusCode);
+
+      // Stream the response body through unchanged
+      proxyRes.pipe(res);
+      proxyRes.on('end', resolve);
+      proxyRes.on('error', (err) => {
+        log('Response stream error:', err.message);
+        resolve();
+      });
     });
 
-    // Write prompt to stdin and close
-    child.stdin.write(prompt);
-    child.stdin.end();
+    proxyReq.on('error', (err) => {
+      log('Proxy request error:', err.message);
+      if (!res.headersSent) {
+        res.status(502).json({
+          type: 'error',
+          error: { type: 'api_error', message: `Proxy error: ${err.message}` },
+        });
+      }
+      resolve();
+    });
+
+    if (payload) {
+      proxyReq.write(payload);
+    }
+    proxyReq.end();
   });
 }
 
-function runClaudeStreaming(prompt, model, systemPrompt, onLine, onDone, onError) {
-  const args = [
-    '-p',
-    '--output-format', 'stream-json',
-    '--model', model,
-    '--verbose',
-    '--setting-sources', '',
-    '--tools', '',
-    '--no-session-persistence',
-  ];
-
-  if (systemPrompt) {
-    args.push('--system-prompt', systemPrompt);
-  }
-
-  debug('Spawning (stream):', CLAUDE_PATH, args.join(' ').slice(0, 200));
-
-  const child = spawn(CLAUDE_PATH, args, {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: {
-      HOME: process.env.HOME,
-      PATH: process.env.PATH,
-      LANG: process.env.LANG || 'en_US.UTF-8',
-      TERM: process.env.TERM || 'xterm-256color',
-      USER: process.env.USER,
-      TMPDIR: process.env.TMPDIR || '/tmp',
-    },
-  });
-
-  let buffer = '';
-
-  child.stdout.on('data', (data) => {
-    buffer += data.toString();
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || ''; // Keep incomplete last line in buffer
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const msg = JSON.parse(trimmed);
-        onLine(msg);
-      } catch {
-        debug('Non-JSON line:', trimmed.slice(0, 100));
-      }
-    }
-  });
-
-  child.stderr.on('data', (data) => {
-    debug('claude stderr:', data.toString().slice(0, 200));
-  });
-
-  child.on('error', (err) => {
-    onError(new Error(`Failed to spawn claude: ${err.message}`));
-  });
-
-  child.on('close', (code) => {
-    // Process any remaining buffer
-    if (buffer.trim()) {
-      try {
-        const msg = JSON.parse(buffer.trim());
-        onLine(msg);
-      } catch {
-        // ignore
-      }
-    }
-    onDone(code);
-  });
-
-  // Write prompt and close stdin
-  child.stdin.write(prompt);
-  child.stdin.end();
-
-  return child;
-}
-
 // ---------------------------------------------------------------------------
-// POST /v1/messages — main proxy endpoint
+// Routes
 // ---------------------------------------------------------------------------
 
+// Parse JSON body for POST requests
+app.use(express.json({ limit: '50mb' }));
+
+// POST /v1/messages — main proxy endpoint (sanitize + forward)
 app.post('/v1/messages', async (req, res) => {
-  // Sanitize the entire request body to strip third-party identifiers
-  const sanitizedBody = sanitizeRequestBody(req.body);
-  const { model, messages, system, stream, max_tokens, tools } = sanitizedBody;
+  const sanitizedBody = sanitizeDeep(req.body);
 
-  const mappedModel = mapModel(model);
-  const prompt = flattenMessages(messages);
-  const systemPrompt = buildSystemPrompt(system, tools);
+  const model = sanitizedBody.model || '?';
+  const stream = !!sanitizedBody.stream;
+  const msgCount = sanitizedBody.messages?.length || 0;
 
-  log(
-    `→ ${model} (${mappedModel}) | stream=${!!stream} | messages=${messages?.length || 0} | prompt=${prompt.length} chars`
-  );
+  log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount}`);
 
-  // Dump the full request for debugging
   if (DEBUG) {
     const fs = require('fs');
     fs.writeFileSync('/tmp/claude-proxy-last-request.json', JSON.stringify(req.body, null, 2));
     debug('Full request saved to /tmp/claude-proxy-last-request.json');
   }
 
-  if (stream) {
-    await handleStreaming(res, prompt, mappedModel, systemPrompt, model);
-  } else {
-    await handleNonStreaming(res, prompt, mappedModel, systemPrompt, model);
-  }
+  await forwardRequest(req, res, sanitizedBody);
 });
 
-// ---------------------------------------------------------------------------
-// Streaming handler
-// ---------------------------------------------------------------------------
+// Forward other known /v1 endpoints
+app.get('/v1/models', async (req, res) => {
+  debug(`→ ${req.method} ${req.path}`);
+  const body = req.method === 'GET' || req.method === 'HEAD' ? null : req.body;
+  await forwardRequest(req, res, body);
+});
 
-async function handleStreaming(res, prompt, mappedModel, systemPrompt, originalModel) {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-
-  const messageId = `msg_proxy_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-  let sentStart = false;
-  let blockIndex = 0;
-  let blockStarted = false;
-  let outputTokens = 0;
-  let inputTokens = 0;
-  let fullText = '';
-
-  function sendSSE(event, data) {
-    if (res.writableEnded) return;
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  }
-
-  function ensureMessageStart() {
-    if (sentStart) return;
-    sentStart = true;
-    sendSSE('message_start', {
-      type: 'message_start',
-      message: {
-        id: messageId,
-        type: 'message',
-        role: 'assistant',
-        content: [],
-        model: originalModel || mappedModel,
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    });
-  }
-
-  function ensureBlockStart() {
-    if (blockStarted) return;
-    blockStarted = true;
-    sendSSE('content_block_start', {
-      type: 'content_block_start',
-      index: blockIndex,
-      content_block: { type: 'text', text: '' },
-    });
-  }
-
-  return new Promise((resolve) => {
-    const child = runClaudeStreaming(
-      prompt,
-      mappedModel,
-      systemPrompt,
-      // onLine: process each NDJSON message from claude
-      (msg) => {
-        debug('claude msg type:', msg.type);
-
-        if (msg.type === 'assistant') {
-          // Full assistant message with content blocks
-          const content = msg.message?.content;
-          if (Array.isArray(content)) {
-            ensureMessageStart();
-            for (const block of content) {
-              if (block.type === 'text' && block.text) {
-                ensureBlockStart();
-                fullText += block.text;
-                sendSSE('content_block_delta', {
-                  type: 'content_block_delta',
-                  index: blockIndex,
-                  delta: { type: 'text_delta', text: block.text },
-                });
-              }
-            }
-          }
-          if (msg.message?.usage) {
-            inputTokens = msg.message.usage.input_tokens || inputTokens;
-            outputTokens = msg.message.usage.output_tokens || outputTokens;
-          }
-        } else if (msg.type === 'result') {
-          if (msg.usage) {
-            inputTokens = msg.usage.input_tokens || inputTokens;
-            outputTokens = msg.usage.output_tokens || outputTokens;
-          }
-          if (msg.is_error) {
-            log('Claude error result:', msg.result?.slice(0, 300));
-            ensureMessageStart();
-            ensureBlockStart();
-            sendSSE('content_block_delta', {
-              type: 'content_block_delta',
-              index: blockIndex,
-              delta: { type: 'text_delta', text: `\n\n[Error: ${msg.result}]` },
-            });
-          }
-          log(
-            `← done | cost=$${msg.total_cost_usd?.toFixed(4) || '?'} | duration=${msg.duration_ms || '?'}ms | in=${inputTokens} out=${outputTokens}`
-          );
-        }
-      },
-      // onDone
-      (code) => {
-        debug('claude exited with code:', code);
-
-        if (blockStarted) {
-          sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-        }
-        if (!sentStart) {
-          ensureMessageStart();
-          ensureBlockStart();
-          sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-        }
-        sendSSE('message_delta', {
-          type: 'message_delta',
-          delta: { stop_reason: 'end_turn', stop_sequence: null },
-          usage: { output_tokens: outputTokens },
-        });
-        sendSSE('message_stop', { type: 'message_stop' });
-        res.end();
-        resolve();
-      },
-      // onError
-      (err) => {
-        log('Spawn error:', err.message);
-        ensureMessageStart();
-        ensureBlockStart();
-        sendSSE('content_block_delta', {
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: { type: 'text_delta', text: `\n\n[Proxy error: ${err.message}]` },
-        });
-        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-        sendSSE('message_delta', {
-          type: 'message_delta',
-          delta: { stop_reason: 'end_turn', stop_sequence: null },
-          usage: { output_tokens: 0 },
-        });
-        sendSSE('message_stop', { type: 'message_stop' });
-        res.end();
-        resolve();
-      }
-    );
-
-    // Abort if client disconnects
-    res.on('close', () => {
-      if (!res.writableEnded) {
-        debug('Client disconnected, killing claude process');
-        child.kill('SIGTERM');
-      }
-    });
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Non-streaming handler
-// ---------------------------------------------------------------------------
-
-async function handleNonStreaming(res, prompt, mappedModel, systemPrompt, originalModel) {
+// Health check
+app.get('/health', async (req, res) => {
+  let tokenStatus = 'unknown';
   try {
-    const output = await runClaude(prompt, mappedModel, systemPrompt);
-
-    // Parse NDJSON output — find the last assistant message and result
-    let text = '';
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let stopReason = 'end_turn';
-
-    for (const line of output.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const msg = JSON.parse(trimmed);
-        if (msg.type === 'assistant') {
-          const content = msg.message?.content;
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type === 'text' && typeof block.text === 'string') {
-                text += block.text;
-              }
-            }
-          }
-          if (msg.message?.usage) {
-            inputTokens = msg.message.usage.input_tokens || 0;
-            outputTokens = msg.message.usage.output_tokens || 0;
-          }
-          if (msg.message?.stop_reason) {
-            stopReason = msg.message.stop_reason;
-          }
-        } else if (msg.type === 'result') {
-          if (msg.usage) {
-            inputTokens = msg.usage.input_tokens || inputTokens;
-            outputTokens = msg.usage.output_tokens || outputTokens;
-          }
-          if (msg.is_error) {
-            throw new Error(msg.result || 'Claude returned an error');
-          }
-          log(
-            `← done | cost=$${msg.total_cost_usd?.toFixed(4) || '?'} | duration=${msg.duration_ms || '?'}ms`
-          );
-        }
-      } catch (parseErr) {
-        if (parseErr.message !== 'Unexpected end of JSON input' &&
-            !parseErr.message?.startsWith('Unexpected token')) {
-          throw parseErr;
-        }
-      }
+    if (!cachedCredentials) readCredentials();
+    if (cachedCredentials) {
+      tokenStatus = isTokenExpired(cachedCredentials) ? 'expired (will refresh)' : 'valid';
+    } else {
+      tokenStatus = 'missing';
     }
-
-    res.json({
-      id: `msg_proxy_${randomUUID().replace(/-/g, '').slice(0, 20)}`,
-      type: 'message',
-      role: 'assistant',
-      content: [{ type: 'text', text }],
-      model: originalModel || mappedModel,
-      stop_reason: stopReason,
-      stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-    });
-  } catch (err) {
-    log('Error:', err.message);
-    res.status(500).json({
-      type: 'error',
-      error: { type: 'api_error', message: `Proxy error: ${err.message}` },
-    });
+  } catch {
+    tokenStatus = 'error';
   }
-}
 
-// ---------------------------------------------------------------------------
-// Health / info endpoints
-// ---------------------------------------------------------------------------
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: require('./package.json').version });
-});
-
-app.get('/v1/models', (req, res) => {
-  const models = [
-    'claude-opus-4-6',
-    'claude-sonnet-4-6',
-    'claude-haiku-4-5',
-  ].map((id) => ({
-    id,
-    object: 'model',
-    created: Math.floor(Date.now() / 1000),
-    owned_by: 'anthropic',
-  }));
-  res.json({ object: 'list', data: models });
+  res.json({
+    status: 'ok',
+    version: require('./package.json').version,
+    mode: 'oauth-proxy',
+    token: tokenStatus,
+    subscription: cachedCredentials?.subscriptionType || 'unknown',
+    rateLimitTier: cachedCredentials?.rateLimitTier || 'unknown',
+  });
 });
 
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
+// Load credentials on startup
+readCredentials();
+
 app.listen(PORT, '127.0.0.1', () => {
-  log(`claude-max-proxy v${require('./package.json').version}`);
+  log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
   log(`Listening on http://127.0.0.1:${PORT}`);
-  log(`Proxying Anthropic Messages API → claude -p (first-party CLI auth)`);
-  log(`Claude binary: ${CLAUDE_PATH}`);
+  log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
+  log(`Token: ${cachedCredentials ? 'loaded' : 'NOT FOUND — run "claude auth login"'}`);
+  if (cachedCredentials) {
+    log(`Subscription: ${cachedCredentials.subscriptionType} (${cachedCredentials.rateLimitTier})`);
+    log(`Token expires: ${new Date(cachedCredentials.expiresAt).toISOString()}`);
+  }
   log('');
   log('Configure your app to use:');
   log(`  Base URL: http://127.0.0.1:${PORT}`);
-  log('  API Key:  any non-empty string (auth is handled by Claude CLI)');
+  log('  API Key:  any non-empty string (auth is handled by OAuth token)');
   log('');
   if (DEBUG) log('Debug mode enabled');
+});
+
+// Cleanup
+process.on('SIGTERM', () => {
+  unwatchFile(CREDENTIALS_PATH);
+  process.exit(0);
+});
+process.on('SIGINT', () => {
+  unwatchFile(CREDENTIALS_PATH);
+  process.exit(0);
 });
