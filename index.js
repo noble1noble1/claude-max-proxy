@@ -37,6 +37,8 @@ const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claud
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
+const { randomUUID } = require('crypto');
+const PROXY_SESSION_ID = randomUUID();
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -209,6 +211,55 @@ function sanitizeDeep(obj) {
 // Reverse proxy: forward to api.anthropic.com
 // ---------------------------------------------------------------------------
 
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 2000;
+
+function buildHeaders(accessToken, req) {
+  const headers = {
+    'x-api-key': accessToken,
+    'content-type': 'application/json',
+    'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+    // Identify as CLI client for first-party billing classification
+    'anthropic-client-platform': 'cli',
+    'user-agent': 'Anthropic/JS 0.80.0',
+    // Session ID (required for proper rate limit tier)
+    'x-claude-code-session-id': PROXY_SESSION_ID,
+    // Stainless SDK telemetry (matches CLI fingerprint)
+    'x-stainless-lang': 'js',
+    'x-stainless-package-version': '0.80.0',
+    'x-stainless-os': process.platform,
+    'x-stainless-arch': process.arch,
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': process.versions.node,
+  };
+  if (req.headers['anthropic-beta']) {
+    headers['anthropic-beta'] = req.headers['anthropic-beta'];
+  }
+  return headers;
+}
+
+function makeRequest(targetUrl, method, headers, payload) {
+  return new Promise((resolve, reject) => {
+    const transport = targetUrl.protocol === 'https:' ? https : http;
+    const proxyReq = transport.request(targetUrl, { method, headers }, (proxyRes) => {
+      if (proxyRes.statusCode === 429 && proxyRes.headers['x-should-retry'] === 'true') {
+        // Consume body so connection can be reused, then signal retry
+        let body = '';
+        proxyRes.on('data', (d) => { body += d; });
+        proxyRes.on('end', () => {
+          const retryAfter = proxyRes.headers['retry-after'];
+          resolve({ retry: true, retryAfterMs: retryAfter ? parseInt(retryAfter) * 1000 : null, body });
+        });
+        return;
+      }
+      resolve({ retry: false, proxyRes });
+    });
+    proxyReq.on('error', reject);
+    if (payload) proxyReq.write(payload);
+    proxyReq.end();
+  });
+}
+
 function forwardRequest(req, res, body) {
   return new Promise(async (resolve) => {
     let accessToken;
@@ -224,45 +275,50 @@ function forwardRequest(req, res, body) {
     }
 
     const targetUrl = new URL(req.path, ANTHROPIC_BASE);
-    // Forward query params
     if (req.url.includes('?')) {
       targetUrl.search = req.url.split('?')[1];
     }
 
-    const headers = {
-      'x-api-key': accessToken,
-      'content-type': 'application/json',
-      'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-      // Identify as CLI client for first-party billing classification
-      'anthropic-client-platform': 'cli',
-      'user-agent': 'Anthropic/JS 0.80.0',
-      // Stainless SDK telemetry (matches CLI fingerprint)
-      'x-stainless-lang': 'js',
-      'x-stainless-package-version': '0.80.0',
-      'x-stainless-os': process.platform,
-      'x-stainless-arch': process.arch,
-      'x-stainless-runtime': 'node',
-      'x-stainless-runtime-version': process.versions.node,
-    };
-
-    // Forward anthropic-beta header if present
-    if (req.headers['anthropic-beta']) {
-      headers['anthropic-beta'] = req.headers['anthropic-beta'];
-    }
-
-    debug(`→ ${req.method} ${targetUrl.toString()}`);
+    const headers = buildHeaders(accessToken, req);
 
     const payload = body ? JSON.stringify(body) : undefined;
     if (payload) {
       headers['content-length'] = Buffer.byteLength(payload);
     }
 
-    const transport = targetUrl.protocol === 'https:' ? https : http;
+    // Retry loop for transient 429s
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      debug(`→ ${req.method} ${targetUrl.toString()} (attempt ${attempt + 1})`);
 
-    const proxyReq = transport.request(targetUrl, {
-      method: req.method,
-      headers,
-    }, (proxyRes) => {
+      let result;
+      try {
+        result = await makeRequest(targetUrl, req.method, { ...headers }, payload);
+      } catch (err) {
+        log('Proxy request error:', err.message);
+        if (!res.headersSent) {
+          res.status(502).json({
+            type: 'error',
+            error: { type: 'api_error', message: `Proxy error: ${err.message}` },
+          });
+        }
+        return resolve();
+      }
+
+      if (result.retry && attempt < MAX_RETRIES) {
+        const delayMs = result.retryAfterMs || (RETRY_BASE_MS * Math.pow(2, attempt));
+        log(`429 rate limited, retrying in ${delayMs}ms (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+
+      if (result.retry) {
+        // Exhausted retries, return the 429
+        log(`429 rate limited, exhausted ${MAX_RETRIES + 1} attempts`);
+        res.status(429).json(JSON.parse(result.body));
+        return resolve();
+      }
+
+      const { proxyRes } = result;
       debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
 
       // Copy response headers
@@ -281,23 +337,8 @@ function forwardRequest(req, res, body) {
         log('Response stream error:', err.message);
         resolve();
       });
-    });
-
-    proxyReq.on('error', (err) => {
-      log('Proxy request error:', err.message);
-      if (!res.headersSent) {
-        res.status(502).json({
-          type: 'error',
-          error: { type: 'api_error', message: `Proxy error: ${err.message}` },
-        });
-      }
-      resolve();
-    });
-
-    if (payload) {
-      proxyReq.write(payload);
+      return; // Exit the retry loop
     }
-    proxyReq.end();
   });
 }
 
