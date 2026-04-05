@@ -242,6 +242,36 @@ function sanitizeRequest(body) {
 }
 
 // ---------------------------------------------------------------------------
+// CLI billing attribution — prepend billing header to system prompt
+// ---------------------------------------------------------------------------
+
+const CLI_VERSION = '2.1.92';
+const CLI_ENTRYPOINT = process.env.CLAUDE_CODE_ENTRYPOINT || 'cli';
+
+function buildBillingHeader() {
+  return `x-anthropic-billing-header: cc_version=${CLI_VERSION}.${PROXY_SESSION_ID.slice(0, 8)}; cc_entrypoint=${CLI_ENTRYPOINT}; cch=00000;`;
+}
+
+function injectBillingHeader(body) {
+  if (!body || typeof body !== 'object') return body;
+  const result = { ...body };
+  const billingBlock = { type: 'text', text: buildBillingHeader() };
+
+  if (!result.system) {
+    // No system prompt — add billing header as system
+    result.system = [billingBlock];
+  } else if (typeof result.system === 'string') {
+    // String system prompt — convert to blocks and prepend billing header
+    result.system = [billingBlock, { type: 'text', text: result.system }];
+  } else if (Array.isArray(result.system)) {
+    // Already blocks — prepend billing header
+    result.system = [billingBlock, ...result.system];
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Reverse proxy: forward to api.anthropic.com
 // ---------------------------------------------------------------------------
 
@@ -389,7 +419,7 @@ app.use(express.json({ limit: '50mb' }));
 
 // POST /v1/messages — main proxy endpoint (sanitize + forward)
 app.post('/v1/messages', async (req, res) => {
-  const sanitizedBody = sanitizeRequest(req.body);
+  const sanitizedBody = injectBillingHeader(sanitizeRequest(req.body));
 
   const model = sanitizedBody.model || '?';
   const stream = !!sanitizedBody.stream;
