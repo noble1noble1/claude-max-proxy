@@ -10,33 +10,38 @@ Your App (OpenClaw, SillyTavern, TypingMind, etc.)
     |  Standard Anthropic Messages API
     |  POST /v1/messages
     v
-+---------------------------------+
-|   claude-max-proxy              |
-|   localhost:4523                |
-|                                 |
-|  1. Reads OAuth token from      |
-|     ~/.claude/.credentials.json |
-|  2. Sanitizes prompt            |
-|  3. Forwards request verbatim   |
-+---------------------------------+
++-----------------------------------------+
+|   claude-max-proxy                      |
+|   localhost:4523                        |
+|                                         |
+|  1. Reads OAuth token from              |
+|     ~/.claude/.credentials.json         |
+|  2. Sanitizes system/user text blocks   |
+|  3. Injects CLI billing attribution     |
+|     into system prompt                  |
+|  4. Forwards request verbatim           |
++-----------------------------------------+
     |
     |  x-api-key: <OAuth token>
     |  anthropic-client-platform: cli
+    |  + billing header in system prompt
     v
-+---------------------------------+
-|   api.anthropic.com             |
-|                                 |
-|  Billed as first-party          |
-|  Uses Max plan limits           |
-|  NOT extra usage                |
-+---------------------------------+
++-----------------------------------------+
+|   api.anthropic.com                     |
+|                                         |
+|  Billed as first-party CLI usage        |
+|  Uses Max plan limits                   |
+|  NOT extra usage                        |
++-----------------------------------------+
 ```
 
 ## Why?
 
-Anthropic's April 2026 billing change classifies direct API calls from third-party apps as "extra usage" — billed separately from your $200/mo Max subscription. But requests that go through the Claude Code CLI are "first-party" and included in your plan.
+Anthropic's April 2026 billing change classifies direct API calls from third-party apps as "extra usage" — billed separately from your $200/mo Max subscription. But requests made through the Claude Code CLI are "first-party" and included in your plan.
 
-This proxy reads the OAuth token that the Claude CLI stores locally and uses it to forward your app's API requests as first-party traffic. No CLI process spawning, no request translation — just auth injection and prompt sanitization.
+This proxy reads the OAuth token that the Claude CLI stores locally and forwards your app's API requests as first-party traffic. It also injects the CLI's billing attribution header into the system prompt — this is what Anthropic checks to classify requests as first-party. Without it, premium models (opus/sonnet) are rate-limited even with a valid OAuth token.
+
+No CLI process spawning, no request translation — just auth injection, billing attribution, and prompt sanitization.
 
 ## Quick start
 
@@ -72,6 +77,8 @@ curl http://localhost:4523/health
 }
 ```
 
+The health endpoint warns if the account is not a Max subscription.
+
 ## App configuration
 
 Point your app's Anthropic base URL at the proxy. The API key can be any non-empty string — auth is handled by the proxy.
@@ -85,10 +92,10 @@ Point your app's Anthropic base URL at the proxy. The API key can be any non-emp
 
 ## What passes through
 
-Everything. The proxy forwards requests and responses verbatim — it only modifies auth headers and sanitizes prompt strings. This means full support for:
+Everything. The proxy forwards requests and responses verbatim — it only modifies the system prompt (billing header + sanitization) and injects auth headers. This means full support for:
 
-- **Tool use** — structured `tool_use` / `tool_result` blocks
-- **Streaming** — native SSE events from Anthropic
+- **Tool use** — structured `tool_use` / `tool_result` blocks pass through natively
+- **Streaming** — native SSE events from Anthropic, untouched
 - **Images / vision** — base64 image blocks
 - **Extended thinking** — thinking blocks pass through
 - **Cache control** — prompt caching headers and stats
@@ -96,7 +103,7 @@ Everything. The proxy forwards requests and responses verbatim — it only modif
 
 ## Prompt sanitization
 
-The proxy replaces known third-party app identifiers to avoid extra-usage billing triggers:
+The proxy replaces known third-party app identifiers in **system prompts and user text blocks only**. Tool definitions, tool results, assistant messages, and all other metadata pass through untouched.
 
 | Pattern | Replacement |
 |---------|-------------|
@@ -106,7 +113,13 @@ The proxy replaces known third-party app identifiers to avoid extra-usage billin
 | `HEARTBEAT`, `HEARTBEAT_OK` | `PERIODIC_CHECK`, `HB_ACK` |
 | `SOUL.md` | `PERSONA.md` |
 
+A post-sanitization leak check verifies no blocked terms remain in outgoing system/user text. If a leak is detected, the request is blocked with a `sanitization_error` rather than forwarded.
+
 Customize patterns in `SANITIZE_PATTERNS` in `index.js`.
+
+## Rate limit handling
+
+The proxy retries on transient 429 errors (up to 3 attempts with exponential backoff) when Anthropic returns `x-should-retry: true`. This smooths over brief rate limit windows without surfacing errors to your app.
 
 ## Token management
 
@@ -117,15 +130,16 @@ The proxy reads OAuth credentials from `~/.claude/.credentials.json` (written by
 - Refresh uses Anthropic's OAuth endpoint with the stored refresh token
 - Updated credentials are written back to the file
 - File is watched for external changes (e.g., CLI refreshes token independently)
+- Concurrent refresh attempts are deduplicated
 
-If the token is missing or invalid, run `claude auth login` to re-authenticate.
+If the token is missing or invalid, the proxy returns a clear error with the action: `Run "claude auth login" to re-authenticate`.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `4523` | Port the proxy listens on |
-| `DEBUG` | `false` | Set to `1` for verbose logging |
+| `DEBUG` | `false` | Set to `1` for verbose logging (saves requests to `/tmp/`) |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic API endpoint |
 | `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials |
 
@@ -135,7 +149,7 @@ If the token is missing or invalid, run `claude auth login` to re-authenticate.
 |--------|------|-------------|
 | `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming) |
 | `GET` | `/v1/models` | Forwards to Anthropic's model list |
-| `GET` | `/health` | Health check with token status |
+| `GET` | `/health` | Health check with token status and Max plan validation |
 
 ## Running as a service
 
