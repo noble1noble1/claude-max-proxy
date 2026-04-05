@@ -23,11 +23,11 @@
   "type": "commonjs",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MovementBD/claude-max-proxy.git"
+    "url": "git+https://github.com/wiziswiz/claude-max-proxy.git"
   },
-  "homepage": "https://github.com/MovementBD/claude-max-proxy#readme",
+  "homepage": "https://github.com/wiziswiz/claude-max-proxy#readme",
   "bugs": {
-    "url": "https://github.com/MovementBD/claude-max-proxy/issues"
+    "url": "https://github.com/wiziswiz/claude-max-proxy/issues"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -50,7 +50,7 @@ However, requests made through the official Claude Code CLI (`claude -p`) are tr
 ### Installation
 
 ```bash
-git clone https://github.com/MovementBD/claude-max-proxy.git
+git clone https://github.com/wiziswiz/claude-max-proxy.git
 cd claude-max-proxy
 npm install
 ```
