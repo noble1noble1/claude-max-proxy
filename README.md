@@ -64,6 +64,25 @@ npm install
 node index.js
 ```
 
+### OpenClaw: create sanitization symlinks
+
+The proxy renames OpenClaw-specific paths and filenames in outgoing requests. OpenClaw may later reference those sanitized names when running shell commands or accessing files. Create symlinks so both names resolve correctly:
+
+```bash
+# ~/.openclaw/ → ~/.clawdata/ (path sanitization)
+ln -sf ~/.openclaw ~/.clawdata
+
+# openclaw binary → myapp (name sanitization)
+ln -sf $(which openclaw) ~/.local/bin/myapp
+ln -sf $(which openclaw) ~/.local/bin/openclaw  # if not already in PATH
+
+# Workspace file aliases (if using ~/clawd/)
+ln -sf ~/clawd/SOUL.md ~/clawd/PERSONA.md
+ln -sf ~/clawd/HEARTBEAT.md ~/clawd/STATUSCHECK.md
+```
+
+You only need to do this once. If OpenClaw ever asks you to `mkdir` a path under `~/.clawdata/`, the symlink above will make it resolve to `~/.openclaw/` automatically.
+
 ### Verify
 
 ```bash
