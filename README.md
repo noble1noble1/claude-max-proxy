@@ -301,6 +301,33 @@ Environment=ANTHROPIC_BASE_URL=http://127.0.0.1:4523
 
 Then reload: `sudo systemctl daemon-reload && sudo systemctl restart openclaw-gateway`
 
+### OpenClaw: auth profile getting wiped after `openclaw configure`
+
+Running `openclaw configure` corrupts your auth config — it removes the `anthropic:claude-cli` OAuth profile and replaces it with a direct API key profile that 401s. This breaks all Anthropic model requests silently until the gateway restarts.
+
+**Never run `openclaw configure`** after initial setup.
+
+If it runs anyway (e.g. auto-triggered by an update), restore the profile manually:
+
+```bash
+# Quick check — if this returns 0, you're broken:
+grep -c "anthropic:claude-cli" ~/.openclaw/openclaw.json
+
+# Restore by editing ~/.openclaw/openclaw.json and adding to auth.profiles:
+{
+  "anthropic:claude-cli": {
+    "provider": "anthropic",
+    "mode": "oauth"
+  }
+}
+```
+
+Then restart the openclaw gateway.
+
+**Recommended:** add a daily watchdog cron in openclaw that checks for the profile and alerts you if it goes missing:
+
+> "Add a cron that runs daily and checks if `anthropic:claude-cli` exists in `~/.openclaw/openclaw.json` auth profiles — if it's missing, send me a Telegram/iMessage alert saying the auth profile was wiped"
+
 ## Security
 
 - Binds to `127.0.0.1` only — not exposed to the network
