@@ -99,10 +99,18 @@ if [ -f "$AUTH_PROFILES" ]; then
     console.log(order && order[0] || '');
   " 2>/dev/null)
 
-  if [ "$FIRST_PROFILE" = "anthropic:claude-cli" ]; then
-    log "OK: auth-profiles.json order is correct (claude-cli first)"
+  # Also check if the claude-cli token is expired
+  CLAUDE_CLI_EXPIRED=$(/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "
+    const p = JSON.parse(require('fs').readFileSync('$AUTH_PROFILES','utf8'));
+    const exp = p.profiles && p.profiles['anthropic:claude-cli'] && p.profiles['anthropic:claude-cli'].expires;
+    console.log(!exp || exp < Date.now() ? 'yes' : 'no');
+  " 2>/dev/null)
+
+  if [ "$FIRST_PROFILE" = "anthropic:claude-cli" ] && [ "$CLAUDE_CLI_EXPIRED" != "yes" ]; then
+    log "OK: auth-profiles.json order is correct and token is not expired"
   else
-    log "WARNING: auth-profiles.json order wrong (first: '$FIRST_PROFILE') — restoring"
+    [ "$FIRST_PROFILE" != "anthropic:claude-cli" ] && log "WARNING: auth-profiles.json order wrong (first: '$FIRST_PROFILE') — restoring"
+    [ "$CLAUDE_CLI_EXPIRED" = "yes" ] && log "WARNING: auth-profiles.json claude-cli token expired — extending"
     /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$AUTH_PROFILES" <<'EOF'
 const fs = require('fs');
 const path = process.argv[1];
@@ -116,8 +124,14 @@ data.order.anthropic = ['anthropic:claude-cli'];
 if (!data.lastGood) data.lastGood = {};
 data.lastGood.anthropic = 'anthropic:claude-cli';
 
+// Extend expiry to 1 year from now — the actual auth goes through the proxy,
+// this value just needs to be in the future so openclaw doesn't try to refresh
+if (data.profiles && data.profiles['anthropic:claude-cli']) {
+  data.profiles['anthropic:claude-cli'].expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
+}
+
 fs.writeFileSync(path, JSON.stringify(data, null, 2));
-console.log('Patched: auth-profiles.json order restored');
+console.log('Patched: auth-profiles.json order and expiry restored');
 EOF
     REPAIRED=1
   fi
