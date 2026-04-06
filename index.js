@@ -236,6 +236,16 @@ function sanitizeRequest(body) {
   if (!body || typeof body !== 'object') return body;
   const result = { ...body };
 
+  // Strip trailing assistant messages — some models (sonnet-4-6) don't support
+  // assistant message prefill and return a 400 that crashes the agent run.
+  if (Array.isArray(result.messages) && result.messages.length > 0) {
+    while (result.messages.length > 0 &&
+           result.messages[result.messages.length - 1].role === 'assistant') {
+      debug('Stripped trailing assistant message (prefill not supported)');
+      result.messages = result.messages.slice(0, -1);
+    }
+  }
+
   // Sanitize system prompt with extra patterns
   if (typeof result.system === 'string') {
     result.system = sanitizeString(result.system, true);
