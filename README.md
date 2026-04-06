@@ -259,6 +259,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now claude-max-proxy
 ```
 
+## Troubleshooting
+
+### "CLI isn't in PATH for exec sessions"
+
+If your orchestrator reports the CLI isn't in PATH when spawning exec sessions, subprocesses can't find `openclaw` because it's installed inside nvm rather than a standard system path. Fix it by symlinking to a location every shell can find:
+
+```bash
+ln -sf $(which openclaw) ~/.local/bin/openclaw
+```
+
+No restart needed.
+
 ## Security
 
 - Binds to `127.0.0.1` only — not exposed to the network
