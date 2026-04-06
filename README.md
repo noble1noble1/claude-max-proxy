@@ -108,12 +108,44 @@ Point your app's Anthropic base URL at the proxy. The API key can be any non-emp
 
 | App | Setting | Value |
 |-----|---------|-------|
-| OpenClaw | `providers.anthropic.baseUrl` | `http://127.0.0.1:4523` |
+| OpenClaw | See full config below | `http://127.0.0.1:4523` |
 | SillyTavern | API URL (Claude) | `http://127.0.0.1:4523` |
 | TypingMind | Custom Endpoint | `http://127.0.0.1:4523` |
 | Custom apps | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:4523` |
 
 **Important:** After changing the config, restart your app's gateway/server so it picks up the new base URL.
+
+### OpenClaw: full `openclaw.json` config
+
+OpenClaw v2026.4.5+ requires a `models` array alongside `baseUrl` — omitting it causes a validation error and openclaw silently removes the `baseUrl`, sending requests directly to Anthropic instead of through the proxy. This causes "You're out of extra usage" 400 errors because openclaw fingerprints reach Anthropic unfiltered.
+
+Add this to `~/.openclaw/openclaw.json` under `models.providers`:
+
+```json
+"models": {
+  "providers": {
+    "anthropic": {
+      "baseUrl": "http://127.0.0.1:4523",
+      "apiKey": "claude-max-proxy",
+      "models": [
+        { "id": "claude-opus-4-6",   "name": "Claude Opus 4.6",   "api": "anthropic-messages" },
+        { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "api": "anthropic-messages" },
+        { "id": "claude-haiku-4-5",  "name": "Claude Haiku 4.5",  "api": "anthropic-messages" }
+      ]
+    }
+  }
+}
+```
+
+Also confirm `auth.profiles` contains:
+
+```json
+"auth": {
+  "profiles": {
+    "anthropic:claude-cli": { "provider": "anthropic", "mode": "oauth" }
+  }
+}
+```
 
 ## What passes through
 
@@ -206,6 +238,7 @@ If the token is missing or invalid, the proxy returns a clear error with the act
 | `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming) |
 | `GET` | `/v1/models` | Forwards to Anthropic's model list |
 | `GET` | `/health` | Health check with token status and Max plan validation |
+| `POST` | `/force-refresh` | Force immediate OAuth token refresh regardless of local expiry |
 
 ## Running as a service
 
@@ -326,24 +359,54 @@ Running `openclaw configure` corrupts your auth config — it removes the `anthr
 
 **Never run `openclaw configure`** after initial setup.
 
-If it runs anyway (e.g. auto-triggered by an update), restore the profile manually:
+If it runs anyway (e.g. auto-triggered by an update), you need to restore **two files**:
+
+**1. `~/.openclaw/openclaw.json`** — restore `auth.profiles`:
 
 ```bash
 # Quick check — if this returns 0, you're broken:
 grep -c "anthropic:claude-cli" ~/.openclaw/openclaw.json
+```
 
-# Restore by editing ~/.openclaw/openclaw.json and adding to auth.profiles:
-{
-  "anthropic:claude-cli": {
-    "provider": "anthropic",
-    "mode": "oauth"
+Edit `~/.openclaw/openclaw.json` and ensure `auth.profiles` contains:
+
+```json
+"auth": {
+  "profiles": {
+    "anthropic:claude-cli": { "provider": "anthropic", "mode": "oauth" }
   }
 }
 ```
 
+Remove any `anthropic:default` or `anthropic:manual` entries — they use direct API keys that 401 with OAuth tokens.
+
+**2. `~/.openclaw/agents/main/agent/auth-profiles.json`** — restore order and expiry:
+
+This runtime file controls which auth profile openclaw tries first. After `openclaw configure`, the `order` array gets filled with stale token profiles that all fail, while `anthropic:claude-cli` is excluded. Also, the `expires` field on the claude-cli profile resets to ~8 hours, causing openclaw to skip it once that window passes.
+
+Set the following:
+
+```json
+{
+  "order": { "anthropic": ["anthropic:claude-cli"] },
+  "lastGood": { "anthropic": "anthropic:claude-cli" },
+  "profiles": {
+    "anthropic:claude-cli": {
+      "type": "oauth",
+      "provider": "anthropic",
+      "access": "<your sk-ant-oat01-* token from ~/.claude/.credentials.json>",
+      "refresh": "<your sk-ant-ort01-* refresh token>",
+      "expires": 1807039170812
+    }
+  }
+}
+```
+
+The `expires` value is 1 year from now — the actual auth is handled by the proxy using `~/.claude/.credentials.json`, so this field just needs to be in the future to prevent openclaw from skipping the profile. You can generate a fresh value with: `node -e "console.log(Date.now() + 365*24*60*60*1000)"`
+
 Then restart the openclaw gateway.
 
-**Recommended:** run the included watchdog script hourly via cron. It checks both the auth profile and the gateway plist env vars, auto-repairs either if missing, restarts the gateway, and sends a Telegram alert:
+**Recommended:** run the included watchdog script hourly via cron. It checks and auto-repairs both files, restarts the gateway, and sends a Telegram alert:
 
 ```bash
 # Install the watchdog
@@ -355,10 +418,32 @@ chmod +x ~/bin/openclaw-auth-watchdog
 ```
 
 The watchdog checks:
-1. `anthropic:claude-cli` auth profile in `openclaw.json`
+1. `anthropic:claude-cli` profile in `openclaw.json`
 2. `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` in the gateway LaunchAgent plist
+3. `order.anthropic` in `auth-profiles.json` (ensures claude-cli is first)
+4. `expires` on the claude-cli profile (extends to 1 year if expired)
+5. Makes a live test request to Anthropic to verify the token is accepted server-side
 
-If either is missing it repairs, reloads the plist, restarts the gateway, and sends a Telegram alert.
+If any check fails it repairs, reloads the plist, restarts the gateway, and sends a Telegram alert.
+
+### OAuth token rejected by Anthropic server-side (`overage-status: rejected` + HTTP 400)
+
+The `anthropic-ratelimit-unified-overage-disabled-reason: org_level_disabled` header appears on **every response including successful ones** — it is normal and not a sign of a problem.
+
+If you see HTTP 400 "You're out of extra usage" despite the proxy health showing `token: valid` and `subscription: max`, the cause is one of:
+
+**A) Requests are bypassing the proxy** — openclaw is talking directly to `api.anthropic.com` instead of `http://127.0.0.1:4523`, so openclaw fingerprints reach Anthropic unfiltered. Anthropic detects the third-party app and routes the request to an "extra usage" billing pool. Verify the `baseUrl` and `models` array are both set in `openclaw.json` (see App Configuration above).
+
+**B) OAuth token invalidated server-side** — Anthropic can invalidate a token before its local `expiresAt` timestamp. The proxy won't catch this because it only refreshes 5 minutes before the local expiry.
+
+Force an immediate refresh:
+
+```bash
+curl -X POST http://127.0.0.1:4523/force-refresh
+# → {"status":"ok","newExpiry":"2026-04-07T06:35:59.243Z"}
+```
+
+The watchdog calls this automatically if its live test request returns 401.
 
 ## Security
 
