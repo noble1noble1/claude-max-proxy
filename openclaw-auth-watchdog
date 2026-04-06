@@ -111,4 +111,18 @@ if [ "$REPAIRED" -eq 1 ]; then
   fi
 fi
 
+# ── Proactive token refresh ───────────────────────────────────────────────────
+# Ping the proxy health endpoint every run to keep the OAuth token warm.
+# The proxy auto-refreshes 5min before expiry on any request — this ensures
+# that happens even during long idle periods with no real traffic.
+PROXY_URL="http://127.0.0.1:4523"
+HEALTH=$(curl -s --max-time 5 "$PROXY_URL/health" 2>/dev/null)
+if echo "$HEALTH" | grep -q '"token":"valid"'; then
+  log "Proxy token: valid (pinged for refresh)"
+elif echo "$HEALTH" | grep -q '"token"'; then
+  log "WARNING: proxy token state — $HEALTH"
+else
+  log "WARNING: proxy not responding at $PROXY_URL"
+fi
+
 log "Done"
