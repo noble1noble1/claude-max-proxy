@@ -1,0 +1,114 @@
+#!/bin/bash
+# openclaw-auth-watchdog
+# Checks two things every hour:
+#   1. anthropic:claude-cli auth profile exists in openclaw.json
+#   2. ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL are set in the gateway plist
+# If either is missing, auto-repairs and restarts the gateway.
+
+CONFIG="$HOME/.openclaw/openclaw.json"
+PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
+LOG="/tmp/openclaw-auth-watchdog.log"
+REPAIRED=0
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
+}
+
+if [ ! -f "$CONFIG" ]; then
+  log "ERROR: openclaw.json not found at $CONFIG"
+  exit 1
+fi
+
+# ── Check 1: plist env vars ──────────────────────────────────────────────────
+if [ -f "$PLIST" ]; then
+  MISSING_VARS=""
+  grep -q "ANTHROPIC_API_KEY" "$PLIST" || MISSING_VARS="$MISSING_VARS ANTHROPIC_API_KEY"
+  grep -q "ANTHROPIC_BASE_URL" "$PLIST" || MISSING_VARS="$MISSING_VARS ANTHROPIC_BASE_URL"
+
+  if [ -n "$MISSING_VARS" ]; then
+    log "WARNING: plist missing env vars:$MISSING_VARS — restoring"
+    /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$PLIST" <<'EOF'
+const fs = require('fs');
+const path = process.argv[1];
+let content = fs.readFileSync(path, 'utf8');
+
+const vars = {
+  'ANTHROPIC_API_KEY': 'claude-max-proxy',
+  'ANTHROPIC_BASE_URL': 'http://127.0.0.1:4523',
+};
+
+for (const [key, value] of Object.entries(vars)) {
+  if (!content.includes(`<key>${key}</key>`)) {
+    content = content.replace(
+      '</dict>\n</dict>',
+      `    <key>${key}</key>\n    <string>${value}</string>\n    </dict>\n</dict>`
+    );
+    console.log(`Added ${key}`);
+  }
+}
+
+fs.writeFileSync(path, content);
+EOF
+    REPAIRED=1
+  else
+    log "OK: plist env vars present"
+  fi
+fi
+
+# ── Check 2: auth profile ────────────────────────────────────────────────────
+if grep -q '"anthropic:claude-cli"' "$CONFIG"; then
+  log "OK: anthropic:claude-cli profile present"
+else
+  log "WARNING: anthropic:claude-cli profile missing — restoring"
+
+  # Use node to safely patch the JSON (avoids sed mangling)
+  /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$CONFIG" <<'EOF'
+const fs = require('fs');
+const path = process.argv[1];
+const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+
+if (!config.auth) config.auth = {};
+if (!config.auth.profiles) config.auth.profiles = {};
+
+config.auth.profiles['anthropic:claude-cli'] = { provider: 'anthropic', mode: 'oauth' };
+
+// Move to front so it takes precedence
+const profiles = { 'anthropic:claude-cli': config.auth.profiles['anthropic:claude-cli'] };
+for (const [k, v] of Object.entries(config.auth.profiles)) {
+  if (k !== 'anthropic:claude-cli') profiles[k] = v;
+}
+config.auth.profiles = profiles;
+
+// Remove bad profiles that cause 401s
+delete config.auth.profiles['anthropic:default'];
+delete config.auth.profiles['anthropic:manual'];
+
+fs.writeFileSync(path, JSON.stringify(config, null, 2));
+console.log('Patched: anthropic:claude-cli restored');
+EOF
+  REPAIRED=1
+fi
+
+# ── Restart + alert if anything was repaired ─────────────────────────────────
+if [ "$REPAIRED" -eq 1 ]; then
+  log "Repairs made — reloading gateway plist and restarting"
+  launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null
+  sleep 2
+  launchctl bootstrap gui/$UID "$PLIST" 2>/dev/null
+  sleep 3
+
+  TELEGRAM_CONFIG="$HOME/.openclaw/credentials/telegram-api.json"
+  if [ -f "$TELEGRAM_CONFIG" ]; then
+    BOT_TOKEN=$(/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "const c=require('$TELEGRAM_CONFIG'); console.log(c.bot_token||c.token||'')" 2>/dev/null)
+    CHAT_ID=$(cat "$HOME/.openclaw/credentials/telegram-allowFrom.json" 2>/dev/null | /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); console.log(Array.isArray(d)?d[0]:d)" 2>/dev/null)
+    if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+      curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        -d "chat_id=$CHAT_ID" \
+        -d "text=⚠️ openclaw-auth-watchdog auto-repaired config (openclaw configure likely ran). Gateway restarted. Check that everything is working." \
+        > /dev/null
+      log "Telegram alert sent"
+    fi
+  fi
+fi
+
+log "Done"

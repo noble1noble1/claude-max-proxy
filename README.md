@@ -343,9 +343,22 @@ grep -c "anthropic:claude-cli" ~/.openclaw/openclaw.json
 
 Then restart the openclaw gateway.
 
-**Recommended:** add a daily watchdog cron in openclaw that checks for the profile and alerts you if it goes missing:
+**Recommended:** run the included watchdog script hourly via cron. It checks both the auth profile and the gateway plist env vars, auto-repairs either if missing, restarts the gateway, and sends a Telegram alert:
 
-> "Add a cron that runs daily and checks if `anthropic:claude-cli` exists in `~/.openclaw/openclaw.json` auth profiles — if it's missing, send me a Telegram/iMessage alert saying the auth profile was wiped"
+```bash
+# Install the watchdog
+cp openclaw-auth-watchdog ~/bin/openclaw-auth-watchdog
+chmod +x ~/bin/openclaw-auth-watchdog
+
+# Add hourly cron
+(crontab -l 2>/dev/null; echo "0 * * * * $HOME/bin/openclaw-auth-watchdog >> /tmp/openclaw-auth-watchdog.log 2>&1") | crontab -
+```
+
+The watchdog checks:
+1. `anthropic:claude-cli` auth profile in `openclaw.json`
+2. `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` in the gateway LaunchAgent plist
+
+If either is missing it repairs, reloads the plist, restarts the gateway, and sends a Telegram alert.
 
 ## Security
 
