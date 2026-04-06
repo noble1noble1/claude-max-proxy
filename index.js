@@ -516,9 +516,20 @@ app.post('/v1/messages', async (req, res) => {
 
   log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount}`);
 
-  // Verify sanitization: scan full outgoing request for leaked identifiers
+  // Verify sanitization — scan only the fields we actually sanitize.
+  // tool_result blocks are intentionally excluded from sanitization (exec output),
+  // so exclude them from the leak check too.
   const BLOCKED_TERMS = ['openclaw', 'open-claw', 'sillytavern', 'silly-tavern', 'typingmind', 'typing-mind'];
-  const outgoing = JSON.stringify(sanitizedBody).toLowerCase();
+  const checkBody = {
+    ...sanitizedBody,
+    messages: (sanitizedBody.messages || []).map(msg => ({
+      ...msg,
+      content: Array.isArray(msg.content)
+        ? msg.content.filter(b => b?.type !== 'tool_result')
+        : msg.content,
+    })),
+  };
+  const outgoing = JSON.stringify(checkBody).toLowerCase();
   const leaks = BLOCKED_TERMS.filter(term => outgoing.includes(term));
   if (leaks.length > 0) {
     log(`⚠ SANITIZATION LEAK: found [${leaks.join(', ')}] in outgoing request — blocking`);
