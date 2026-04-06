@@ -599,6 +599,30 @@ app.get('/health', async (req, res) => {
   });
 });
 
+// POST /force-refresh — force immediate token refresh regardless of expiry
+// Useful when Anthropic invalidates the token server-side before local expiry
+app.post('/force-refresh', async (req, res) => {
+  try {
+    log('Force refresh requested');
+    if (!cachedCredentials?.refreshToken) {
+      return res.status(400).json({ error: 'No refresh token available' });
+    }
+    // Temporarily mark token as expired so getValidToken triggers a refresh
+    const saved = cachedCredentials.expiresAt;
+    cachedCredentials.expiresAt = 0;
+    try {
+      const token = await getAccessToken();
+      res.json({ status: 'ok', newExpiry: new Date(cachedCredentials.expiresAt).toISOString() });
+    } catch (err) {
+      cachedCredentials.expiresAt = saved;
+      throw err;
+    }
+  } catch (err) {
+    log('Force refresh failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------

@@ -159,14 +159,38 @@ if [ "$REPAIRED" -eq 1 ]; then
   fi
 fi
 
-# ── Proactive token refresh ───────────────────────────────────────────────────
-# Ping the proxy health endpoint every run to keep the OAuth token warm.
-# The proxy auto-refreshes 5min before expiry on any request — this ensures
-# that happens even during long idle periods with no real traffic.
+# ── Proactive token refresh + validity check ─────────────────────────────────
+# 1. Ping health to check token state
+# 2. Make a real test request to confirm Anthropic actually accepts the token
+#    (catches server-side invalidation even when local expiry looks fine)
 PROXY_URL="http://127.0.0.1:4523"
 HEALTH=$(curl -s --max-time 5 "$PROXY_URL/health" 2>/dev/null)
 if echo "$HEALTH" | grep -q '"token":"valid"'; then
-  log "Proxy token: valid (pinged for refresh)"
+  log "Proxy health: token valid"
+
+  # Verify Anthropic actually accepts the token with a minimal real request
+  TEST_BODY='{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"1"}]}'
+  TEST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+    -X POST "$PROXY_URL/v1/messages" \
+    -H "content-type: application/json" \
+    -H "x-api-key: claude-max-proxy" \
+    -H "anthropic-version: 2023-06-01" \
+    -d "$TEST_BODY" 2>/dev/null)
+
+  if [ "$TEST_STATUS" = "200" ]; then
+    log "Proxy token: Anthropic accepted (HTTP 200)"
+  elif [ "$TEST_STATUS" = "401" ]; then
+    log "WARNING: Anthropic rejected token (HTTP 401) — forcing refresh"
+    REFRESH_RESULT=$(curl -s --max-time 15 -X POST "$PROXY_URL/force-refresh" 2>/dev/null)
+    if echo "$REFRESH_RESULT" | grep -q '"status":"ok"'; then
+      log "Token force-refreshed: $REFRESH_RESULT"
+      REPAIRED=1
+    else
+      log "ERROR: Force refresh failed: $REFRESH_RESULT"
+    fi
+  else
+    log "WARNING: proxy test request returned HTTP $TEST_STATUS"
+  fi
 elif echo "$HEALTH" | grep -q '"token"'; then
   log "WARNING: proxy token state — $HEALTH"
 else
