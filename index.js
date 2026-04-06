@@ -248,7 +248,10 @@ function sanitizeRequest(body) {
     });
   }
 
-  // Sanitize all message content
+  // Sanitize all message content — but skip tool_result blocks entirely.
+  // Tool results are exec outputs (shell commands, file reads, etc.) and don't
+  // need sanitization for billing detection. Sanitizing them corrupts file paths
+  // and binary names in exec session output, breaking openclaw's self-diagnosis.
   if (Array.isArray(result.messages)) {
     result.messages = result.messages.map(msg => {
       if (typeof msg.content === 'string') {
@@ -258,6 +261,8 @@ function sanitizeRequest(body) {
         return {
           ...msg,
           content: msg.content.map(block => {
+            // Skip tool_result blocks — execution output, not app fingerprints
+            if (block?.type === 'tool_result') return block;
             if (typeof block === 'string') return sanitizeString(block);
             if (block && typeof block === 'object') {
               const newBlock = { ...block };
