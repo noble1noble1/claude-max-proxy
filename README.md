@@ -267,9 +267,39 @@ If your orchestrator reports the CLI isn't in PATH when spawning exec sessions, 
 
 ```bash
 ln -sf $(which openclaw) ~/.local/bin/openclaw
+# Also create an alias matching the sanitized name so exec sessions work:
+ln -sf $(which openclaw) ~/.local/bin/myapp
 ```
 
 No restart needed.
+
+### Cron jobs and subagents failing with HTTP 401
+
+Isolated subagent sessions (cron jobs, spawned agents) don't inherit the orchestrator's model config — they hit Anthropic directly rather than routing through the proxy, causing 401s.
+
+Fix: set `ANTHROPIC_BASE_URL` in the environment your orchestrator's gateway process inherits, so all spawned subprocesses pick it up automatically.
+
+**macOS (launchd)** — add to your gateway plist's `EnvironmentVariables` dict:
+
+```xml
+<key>ANTHROPIC_BASE_URL</key>
+<string>http://127.0.0.1:4523</string>
+```
+
+Then reload the LaunchAgent:
+
+```bash
+launchctl bootout gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+```
+
+**Linux (systemd)** — add to your service file's `[Service]` section:
+
+```ini
+Environment=ANTHROPIC_BASE_URL=http://127.0.0.1:4523
+```
+
+Then reload: `sudo systemctl daemon-reload && sudo systemctl restart openclaw-gateway`
 
 ## Security
 
