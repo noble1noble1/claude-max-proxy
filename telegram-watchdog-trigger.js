@@ -152,9 +152,28 @@ async function handleUpdate(update) {
     await sendMessage(chatId, '🔧 Running watchdog...');
 
     const { success, output } = await runWatchdog();
-    const lines = output.split('\n').slice(-30).join('\n'); // last 30 lines
+    const lines = output.split('\n').slice(-30).join('\n');
     const icon = success ? '✅' : '⚠️';
     await sendMessage(chatId, `${icon} *Watchdog complete*\n\`\`\`\n${lines}\n\`\`\``);
+
+  } else if (cmd === '/restart') {
+    log(`Gateway restart requested via Telegram`);
+    await sendMessage(chatId, '🔄 Restarting gateway...');
+
+    execFile('launchctl', ['bootout', `gui/${process.getuid()}`, 'ai.openclaw.gateway'],
+      { timeout: 10000 }, () => {
+        setTimeout(() => {
+          const plist = `${os.homedir()}/Library/LaunchAgents/ai.openclaw.gateway.plist`;
+          execFile('launchctl', ['bootstrap', `gui/${process.getuid()}`, plist],
+            { timeout: 10000 }, async (err) => {
+              if (err) {
+                await sendMessage(chatId, `⚠️ Gateway restart failed: ${err.message}`);
+              } else {
+                await sendMessage(chatId, '✅ Gateway restarted. Try sending a message.');
+              }
+            });
+        }, 2000);
+      });
 
   } else if (cmd === '/status') {
     log(`Status check (requested via Telegram)`);
@@ -171,7 +190,7 @@ async function handleUpdate(update) {
 
   } else if (cmd === '/help') {
     await sendMessage(chatId,
-      `*Watchdog commands:*\n/watchdog — repair auth config + restart gateway\n/fix — same as /watchdog\n/status — check proxy health`
+      `*Watchdog commands:*\n/watchdog — repair auth + restart gateway\n/fix — same as /watchdog\n/restart — force restart gateway (use if watchdog passes but bot is silent)\n/status — check proxy health`
     );
   }
 }
