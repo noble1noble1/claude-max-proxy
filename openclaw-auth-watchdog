@@ -135,13 +135,18 @@ console.log("Patched: auth-profiles.json order, expiry, and cooldown restored");
   fi
 fi
 
-# ── Restart + alert if repairs were made ─────────────────────────────────────
+# ── Always restart gateway ───────────────────────────────────────────────────
+# Restart unconditionally — catches frozen/hung gateway even when all auth
+# checks pass. The restart is fast and harmless if nothing was wrong.
+log "Restarting gateway"
+launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null
+sleep 2
+launchctl bootstrap gui/$UID "$PLIST" 2>/dev/null
+sleep 3
+
+# ── Alert if repairs were made ────────────────────────────────────────────────
 if [ "$REPAIRED" -eq 1 ]; then
-  log "Repairs made — reloading gateway plist and restarting"
-  launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null
-  sleep 2
-  launchctl bootstrap gui/$UID "$PLIST" 2>/dev/null
-  sleep 3
+  log "Repairs made — gateway restarted"
 
   CLAWDBOT="$HOME/.openclaw/clawdbot.json"
   if [ -f "$CLAWDBOT" ]; then
