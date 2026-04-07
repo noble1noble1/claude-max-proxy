@@ -106,32 +106,46 @@ if [ -f "$AUTH_PROFILES" ]; then
     console.log(!exp || exp < Date.now() ? 'yes' : 'no');
   " 2>/dev/null)
 
-  if [ "$FIRST_PROFILE" = "anthropic:claude-cli" ] && [ "$CLAUDE_CLI_EXPIRED" != "yes" ]; then
-    log "OK: auth-profiles.json order is correct and token is not expired"
+  # Also check if claude-cli is in cooldown (openclaw won't use it even if token is valid)
+  CLAUDE_CLI_COOLDOWN=$(/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "
+    const p = JSON.parse(require('fs').readFileSync('$AUTH_PROFILES','utf8'));
+    const stats = p.usageStats && p.usageStats['anthropic:claude-cli'];
+    console.log(stats && stats.cooldownUntil && stats.cooldownUntil > Date.now() ? 'yes' : 'no');
+  " 2>/dev/null)
+
+  if [ "$FIRST_PROFILE" = "anthropic:claude-cli" ] && [ "$CLAUDE_CLI_EXPIRED" != "yes" ] && [ "$CLAUDE_CLI_COOLDOWN" != "yes" ]; then
+    log "OK: auth-profiles.json order, expiry, and cooldown are correct"
   else
     [ "$FIRST_PROFILE" != "anthropic:claude-cli" ] && log "WARNING: auth-profiles.json order wrong (first: '$FIRST_PROFILE') — restoring"
     [ "$CLAUDE_CLI_EXPIRED" = "yes" ] && log "WARNING: auth-profiles.json claude-cli token expired — extending"
+    [ "$CLAUDE_CLI_COOLDOWN" = "yes" ] && log "WARNING: auth-profiles.json claude-cli in cooldown — clearing (proxy token was refreshed, cooldown is stale)"
     /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$AUTH_PROFILES" <<'EOF'
 const fs = require('fs');
 const path = process.argv[1];
 const data = JSON.parse(fs.readFileSync(path, 'utf8'));
 
 if (!data.order) data.order = {};
-// Put claude-cli first, remove the broken token profiles from order
 data.order.anthropic = ['anthropic:claude-cli'];
 
-// Fix lastGood too
 if (!data.lastGood) data.lastGood = {};
 data.lastGood.anthropic = 'anthropic:claude-cli';
 
-// Extend expiry to 1 year from now — the actual auth goes through the proxy,
-// this value just needs to be in the future so openclaw doesn't try to refresh
+// Extend expiry to 1 year from now
 if (data.profiles && data.profiles['anthropic:claude-cli']) {
   data.profiles['anthropic:claude-cli'].expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
 }
 
+// Clear cooldown and error state — once the proxy token is refreshed the
+// cooldown is stale. openclaw won't retry the profile until it's cleared.
+if (data.usageStats && data.usageStats['anthropic:claude-cli']) {
+  delete data.usageStats['anthropic:claude-cli'].cooldownUntil;
+  delete data.usageStats['anthropic:claude-cli'].cooldownReason;
+  data.usageStats['anthropic:claude-cli'].errorCount = 0;
+  delete data.usageStats['anthropic:claude-cli'].failureCounts;
+}
+
 fs.writeFileSync(path, JSON.stringify(data, null, 2));
-console.log('Patched: auth-profiles.json order and expiry restored');
+console.log('Patched: auth-profiles.json order, expiry, and cooldown restored');
 EOF
     REPAIRED=1
   fi
@@ -184,6 +198,25 @@ if echo "$HEALTH" | grep -q '"token":"valid"'; then
     REFRESH_RESULT=$(curl -s --max-time 15 -X POST "$PROXY_URL/force-refresh" 2>/dev/null)
     if echo "$REFRESH_RESULT" | grep -q '"status":"ok"'; then
       log "Token force-refreshed: $REFRESH_RESULT"
+      # Also clear openclaw cooldown — after a 401, openclaw puts claude-cli in
+      # cooldown. Once the token is refreshed the cooldown is stale and must be
+      # cleared or openclaw won't retry the profile.
+      if [ -f "$AUTH_PROFILES" ]; then
+        /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$AUTH_PROFILES" <<'EOF'
+const fs = require('fs');
+const path = process.argv[1];
+const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+if (data.usageStats && data.usageStats['anthropic:claude-cli']) {
+  delete data.usageStats['anthropic:claude-cli'].cooldownUntil;
+  delete data.usageStats['anthropic:claude-cli'].cooldownReason;
+  data.usageStats['anthropic:claude-cli'].errorCount = 0;
+  delete data.usageStats['anthropic:claude-cli'].failureCounts;
+}
+fs.writeFileSync(path, JSON.stringify(data, null, 2));
+console.log('Cleared openclaw cooldown after token refresh');
+EOF
+        log "Cleared openclaw auth cooldown"
+      fi
       REPAIRED=1
     else
       log "ERROR: Force refresh failed: $REFRESH_RESULT"
