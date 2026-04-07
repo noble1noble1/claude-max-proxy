@@ -231,6 +231,7 @@ If the token is missing or invalid, the proxy returns a clear error with the act
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic API endpoint |
 | `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials file |
 | `ANTHROPIC_TOKEN` | *(unset)* | Bypass credentials file — set directly to your `sk-ant-oat01-*` token |
+| `AUTH_HEADER_FORMAT` | `x-api-key` | Auth header format: `x-api-key` (default) or `bearer`. If you get 401 with a valid token, try `bearer` |
 
 ## Endpoints
 
@@ -445,6 +446,31 @@ curl -X POST http://127.0.0.1:4523/force-refresh
 ```
 
 The watchdog calls this automatically if its live test request returns 401.
+
+### Stale proxy process shadowing the LaunchAgent
+
+If you start the proxy manually (`node index.js`) and later switch to running it via LaunchAgent, the manual process keeps holding port 4523. Subsequent `launchctl bootout/bootstrap` cycles restart the LaunchAgent process but it can't bind to the port — the stale manual process is still there. You'll think restarts aren't working when actually the wrong process is serving requests.
+
+Check for and kill stale processes before debugging anything else:
+
+```bash
+# See what's on port 4523
+lsof -i :4523
+
+# Kill any stale node processes running the proxy
+pkill -f "node.*claude-max-proxy"
+pkill -f "node index.js"
+
+# Then restart via LaunchAgent
+launchctl bootout gui/$UID/com.claude-max-proxy 2>/dev/null
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.claude-max-proxy.plist
+```
+
+### OpenClaw auth cooldown after a 401
+
+After a 401, OpenClaw puts the auth profile into a cooldown window and won't retry it for a period. Even after the underlying issue is fixed, OpenClaw may keep failing until the cooldown expires or the session is reset.
+
+If you've fixed the root cause but still see 401s: start a new session (`/new`) to clear the cached failure state.
 
 ## Security
 

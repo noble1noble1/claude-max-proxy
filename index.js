@@ -37,6 +37,10 @@ const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claud
 // ANTHROPIC_TOKEN env var: bypass credentials file entirely — set to your sk-ant-oat01-* token directly.
 // Useful when Claude Code stores credentials in macOS Keychain instead of ~/.claude/.credentials.json.
 const ANTHROPIC_TOKEN_OVERRIDE = process.env.ANTHROPIC_TOKEN || null;
+// AUTH_HEADER_FORMAT: 'x-api-key' (default) or 'bearer'.
+// Most setups work with x-api-key. Some macOS Keychain-sourced tokens require Authorization: Bearer.
+// If you get 401 invalid x-api-key with a valid sk-ant-oat01-* token, try: AUTH_HEADER_FORMAT=bearer
+const AUTH_HEADER_FORMAT = (process.env.AUTH_HEADER_FORMAT || 'x-api-key').toLowerCase();
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
@@ -430,8 +434,12 @@ const REQUIRED_BETAS = [
 ];
 
 function buildHeaders(accessToken, req) {
+  const authHeaders = AUTH_HEADER_FORMAT === 'bearer'
+    ? { 'authorization': `Bearer ${accessToken}` }
+    : { 'x-api-key': accessToken };
+
   const headers = {
-    'x-api-key': accessToken,
+    ...authHeaders,
     'content-type': 'application/json',
     'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
     // Identify as CLI client for first-party billing classification
