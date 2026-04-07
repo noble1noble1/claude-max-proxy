@@ -188,6 +188,7 @@ async function refreshToken(creds) {
   }
 
   log('Token refreshed, expires at', new Date(cachedCredentials.expiresAt).toISOString());
+  syncAuthProfiles(cachedCredentials);
   return cachedCredentials;
 }
 
@@ -214,10 +215,48 @@ async function getAccessToken() {
   return refreshed.accessToken;
 }
 
-// Watch credentials file for external changes (e.g., CLI refreshes token)
+// Sync the fresh token into openclaw's auth-profiles.json so openclaw never
+// uses a stale token. This is the root cause of recurring 401s: the proxy
+// refreshes credentials.json but openclaw reads a separate file.
+const AUTH_PROFILES_PATH = join(homedir(), '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
+
+function syncAuthProfiles(creds) {
+  if (!creds?.accessToken) return;
+  try {
+    const { readFileSync: rfs, writeFileSync: wfs } = require('fs');
+    const data = JSON.parse(rfs(AUTH_PROFILES_PATH, 'utf8'));
+    const profile = data?.profiles?.['anthropic:claude-cli'];
+    if (!profile) return;
+
+    const wasStale = profile.access !== creds.accessToken;
+    profile.access = creds.accessToken;
+    profile.refresh = creds.refreshToken || profile.refresh;
+    profile.expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
+
+    // Clear any stale cooldown that might block openclaw from retrying
+    if (data.usageStats?.['anthropic:claude-cli']) {
+      delete data.usageStats['anthropic:claude-cli'].cooldownUntil;
+      delete data.usageStats['anthropic:claude-cli'].cooldownReason;
+      data.usageStats['anthropic:claude-cli'].errorCount = 0;
+      delete data.usageStats['anthropic:claude-cli'].failureCounts;
+    }
+
+    wfs(AUTH_PROFILES_PATH, JSON.stringify(data, null, 2));
+    if (wasStale) {
+      log('[token-sync] Synced fresh token into auth-profiles.json (was stale)');
+    } else {
+      debug('[token-sync] auth-profiles.json already up to date');
+    }
+  } catch (err) {
+    debug('[token-sync] could not sync auth-profiles.json:', err.message);
+  }
+}
+
+// Watch credentials file for external changes (e.g., CLI refreshes token independently)
 watchFile(CREDENTIALS_PATH, { interval: 30_000 }, () => {
-  debug('Credentials file changed, reloading');
+  debug('Credentials file changed externally, reloading and syncing');
   readCredentials();
+  if (cachedCredentials) syncAuthProfiles(cachedCredentials);
 });
 
 // ---------------------------------------------------------------------------
