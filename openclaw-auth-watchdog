@@ -135,14 +135,27 @@ console.log("Patched: auth-profiles.json order, expiry, and cooldown restored");
   fi
 fi
 
-# ── Always restart gateway ───────────────────────────────────────────────────
-# Restart unconditionally — catches frozen/hung gateway even when all auth
-# checks pass. The restart is fast and harmless if nothing was wrong.
-log "Restarting gateway"
-launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null
-sleep 2
-launchctl bootstrap gui/$UID "$PLIST" 2>/dev/null
-sleep 3
+# ── Check if gateway is responsive ──────────────────────────────────────────
+GATEWAY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:18789/health 2>/dev/null)
+if [ "$GATEWAY_STATUS" = "200" ] || [ "$GATEWAY_STATUS" = "401" ]; then
+  GATEWAY_ALIVE=1
+  log "OK: gateway responding (HTTP $GATEWAY_STATUS)"
+else
+  GATEWAY_ALIVE=0
+  log "WARNING: gateway not responding (HTTP $GATEWAY_STATUS) — will restart"
+  REPAIRED=1
+fi
+
+# ── Restart gateway if needed ─────────────────────────────────────────────────
+if [ "$REPAIRED" -eq 1 ]; then
+  log "Restarting gateway"
+  launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null
+  sleep 2
+  launchctl bootstrap gui/$UID "$PLIST" 2>/dev/null
+  sleep 3
+else
+  log "OK: gateway healthy, no restart needed"
+fi
 
 # ── Alert if repairs were made ────────────────────────────────────────────────
 if [ "$REPAIRED" -eq 1 ]; then
