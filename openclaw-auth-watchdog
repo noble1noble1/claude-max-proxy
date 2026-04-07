@@ -85,6 +85,43 @@ console.log("Patched: anthropic:claude-cli restored");
   REPAIRED=1
 fi
 
+# ── Check 3a: sync token from credentials.json → auth-profiles.json ──────────
+CREDS_FILE="$HOME/.claude/.credentials.json"
+if [ -f "$AUTH_PROFILES" ] && [ -f "$CREDS_FILE" ]; then
+  TOKEN_IN_SYNC=$("$NODE" -e "
+    const fs = require('fs'), os = require('os');
+    const creds = JSON.parse(fs.readFileSync('$CREDS_FILE','utf8'));
+    const profiles = JSON.parse(fs.readFileSync('$AUTH_PROFILES','utf8'));
+    const credsToken = creds?.claudeAiOauth?.accessToken || '';
+    const profileToken = profiles?.profiles?.['anthropic:claude-cli']?.access || '';
+    console.log(credsToken && credsToken === profileToken ? 'yes' : 'no');
+  " 2>/dev/null)
+
+  if [ "$TOKEN_IN_SYNC" = "yes" ]; then
+    log "OK: auth-profiles.json token matches credentials.json"
+  else
+    log "WARNING: auth-profiles.json token out of sync with credentials.json — syncing"
+    run_node '
+const fs = require("fs");
+const os = require("os");
+const path = process.argv[1];
+const data = JSON.parse(fs.readFileSync(path, "utf8"));
+const creds = JSON.parse(fs.readFileSync(os.homedir() + "/.claude/.credentials.json", "utf8"));
+const oauth = creds.claudeAiOauth;
+if (oauth && oauth.accessToken && data.profiles && data.profiles["anthropic:claude-cli"]) {
+  data.profiles["anthropic:claude-cli"].access = oauth.accessToken;
+  data.profiles["anthropic:claude-cli"].refresh = oauth.refreshToken;
+  data.profiles["anthropic:claude-cli"].expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
+  fs.writeFileSync(path, JSON.stringify(data, null, 2));
+  console.log("Synced token from credentials.json into auth-profiles");
+} else {
+  console.log("Nothing to sync (missing fields)");
+}
+' "$AUTH_PROFILES"
+    REPAIRED=1
+  fi
+fi
+
 # ── Check 3: auth-profiles.json order, expiry, cooldown ──────────────────────
 if [ -f "$AUTH_PROFILES" ]; then
   FIRST_PROFILE=$("$NODE" -e "
@@ -206,8 +243,24 @@ if echo "$HEALTH" | grep -q '"token":"valid"'; then
       if [ -f "$AUTH_PROFILES" ]; then
         run_node '
 const fs = require("fs");
+const os = require("os");
 const path = process.argv[1];
 const data = JSON.parse(fs.readFileSync(path, "utf8"));
+
+// Sync fresh token from credentials.json into auth-profiles
+const credsPath = os.homedir() + "/.claude/.credentials.json";
+try {
+  const creds = JSON.parse(fs.readFileSync(credsPath, "utf8"));
+  const oauth = creds.claudeAiOauth;
+  if (oauth && oauth.accessToken && data.profiles && data.profiles["anthropic:claude-cli"]) {
+    data.profiles["anthropic:claude-cli"].access = oauth.accessToken;
+    data.profiles["anthropic:claude-cli"].refresh = oauth.refreshToken;
+    data.profiles["anthropic:claude-cli"].expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
+    console.log("Synced fresh token from credentials.json into auth-profiles");
+  }
+} catch(e) { console.log("Could not sync token from credentials:", e.message); }
+
+// Clear cooldown
 if (data.usageStats && data.usageStats["anthropic:claude-cli"]) {
   delete data.usageStats["anthropic:claude-cli"].cooldownUntil;
   delete data.usageStats["anthropic:claude-cli"].cooldownReason;
@@ -217,7 +270,7 @@ if (data.usageStats && data.usageStats["anthropic:claude-cli"]) {
 fs.writeFileSync(path, JSON.stringify(data, null, 2));
 console.log("Cleared openclaw cooldown after token refresh");
 ' "$AUTH_PROFILES"
-        log "Cleared openclaw auth cooldown"
+        log "Synced token and cleared openclaw auth cooldown"
       fi
       REPAIRED=1
     else
