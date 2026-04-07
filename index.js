@@ -266,7 +266,7 @@ const SYSTEM_ONLY_PATTERNS = [
   [/running inside/gi, 'running on'],
 ];
 
-// Tool renames to break tool-set fingerprinting
+// Tool renames to normalize tool-set identifiers in outbound requests
 const TOOL_RENAMES = {
   'sessions_list': 'sess_list',
   'sessions_history': 'sess_history',
@@ -279,6 +279,11 @@ const TOOL_RENAMES = {
   'subagents': 'sub_agents',
   'cron': 'scheduler',
 };
+
+// Reverse map: renamed → original, for restoring tool names in inbound responses
+const TOOL_RENAMES_REVERSE = Object.fromEntries(
+  Object.entries(TOOL_RENAMES).map(([orig, renamed]) => [renamed, orig])
+);
 
 function sanitizeString(text, systemOnly = false) {
   if (typeof text !== 'string') return text;
@@ -488,6 +493,40 @@ function makeRequest(targetUrl, method, headers, payload) {
   });
 }
 
+// Restore renamed tool names in a parsed JSON response object (non-streaming).
+// Anthropic echoes back the tool names we sent — we need to reverse them so
+// OpenClaw receives the original names it registered.
+function desanitizeResponseJson(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(desanitizeResponseJson);
+
+  const result = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === 'name' && typeof v === 'string' && TOOL_RENAMES_REVERSE[v]) {
+      result[k] = TOOL_RENAMES_REVERSE[v];
+    } else if (typeof v === 'object' && v !== null) {
+      result[k] = desanitizeResponseJson(v);
+    } else {
+      result[k] = v;
+    }
+  }
+  return result;
+}
+
+// Restore renamed tool names in a single SSE `data:` line.
+function desanitizeSseLine(line) {
+  if (!line.startsWith('data: ')) return line;
+  const payload = line.slice(6);
+  if (payload === '[DONE]') return line;
+  try {
+    const evt = JSON.parse(payload);
+    const fixed = desanitizeResponseJson(evt);
+    return 'data: ' + JSON.stringify(fixed);
+  } catch {
+    return line;
+  }
+}
+
 function forwardRequest(req, res, body) {
   return new Promise(async (resolve) => {
     let accessToken;
@@ -562,9 +601,46 @@ function forwardRequest(req, res, body) {
       }
       res.status(proxyRes.statusCode);
 
-      // Stream the response body through unchanged
-      proxyRes.pipe(res);
-      proxyRes.on('end', resolve);
+      const contentType = proxyRes.headers['content-type'] || '';
+      const isSSE = contentType.includes('text/event-stream');
+
+      if (isSSE) {
+        // SSE streaming — intercept each line and reverse tool renames
+        let buffer = '';
+        proxyRes.setEncoding('utf8');
+        proxyRes.on('data', (chunk) => {
+          buffer += chunk;
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // keep incomplete last line
+          for (const line of lines) {
+            res.write(desanitizeSseLine(line) + '\n');
+          }
+        });
+        proxyRes.on('end', () => {
+          if (buffer) res.write(desanitizeSseLine(buffer) + '\n');
+          res.end();
+          resolve();
+        });
+      } else {
+        // Non-streaming JSON — buffer full response, reverse tool renames, forward
+        const chunks = [];
+        proxyRes.on('data', (chunk) => chunks.push(chunk));
+        proxyRes.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          try {
+            const parsed = JSON.parse(raw);
+            const fixed = desanitizeResponseJson(parsed);
+            const out = JSON.stringify(fixed);
+            res.setHeader('content-length', Buffer.byteLength(out));
+            res.end(out);
+          } catch {
+            // Not JSON (unlikely) — pass through as-is
+            res.end(raw);
+          }
+          resolve();
+        });
+      }
+
       proxyRes.on('error', (err) => {
         log('Response stream error:', err.message);
         resolve();
