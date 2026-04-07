@@ -1,17 +1,31 @@
 #!/bin/bash
 # openclaw-auth-watchdog
-# Checks two things every hour:
-#   1. anthropic:claude-cli auth profile exists in openclaw.json
-#   2. ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL are set in the gateway plist
-# If either is missing, auto-repairs and restarts the gateway.
+# Runs hourly. Checks and repairs openclaw auth config, proxy token, and cooldown state.
 
 CONFIG="$HOME/.openclaw/openclaw.json"
 PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 LOG="/tmp/openclaw-auth-watchdog.log"
 REPAIRED=0
+NODE=/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node
+AUTH_PROFILES="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
+}
+
+# Run a node script from a string, passing $1 as process.argv[1].
+# Uses a temp file to avoid stdin dependency (heredoc breaks when stdin is unavailable,
+# e.g. when called via execFile from the Telegram trigger).
+run_node() {
+  local script="$1"
+  local arg="$2"
+  local tmp
+  tmp=$(mktemp /tmp/watchdog-node-XXXXXX.js)
+  echo "$script" > "$tmp"
+  "$NODE" "$tmp" "$arg"
+  local rc=$?
+  rm -f "$tmp"
+  return $rc
 }
 
 if [ ! -f "$CONFIG" ]; then
@@ -27,87 +41,65 @@ if [ -f "$PLIST" ]; then
 
   if [ -n "$MISSING_VARS" ]; then
     log "WARNING: plist missing env vars:$MISSING_VARS — restoring"
-    /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$PLIST" <<'EOF'
-const fs = require('fs');
+    run_node '
+const fs = require("fs");
 const path = process.argv[1];
-let content = fs.readFileSync(path, 'utf8');
-
-const vars = {
-  'ANTHROPIC_API_KEY': 'claude-max-proxy',
-  'ANTHROPIC_BASE_URL': 'http://127.0.0.1:4523',
-};
-
+let content = fs.readFileSync(path, "utf8");
+const vars = { ANTHROPIC_API_KEY: "claude-max-proxy", ANTHROPIC_BASE_URL: "http://127.0.0.1:4523" };
 for (const [key, value] of Object.entries(vars)) {
-  if (!content.includes(`<key>${key}</key>`)) {
-    content = content.replace(
-      '</dict>\n</dict>',
-      `    <key>${key}</key>\n    <string>${value}</string>\n    </dict>\n</dict>`
-    );
-    console.log(`Added ${key}`);
+  if (!content.includes("<key>" + key + "</key>")) {
+    content = content.replace("</dict>\n</dict>", "    <key>" + key + "</key>\n    <string>" + value + "</string>\n    </dict>\n</dict>");
+    console.log("Added " + key);
   }
 }
-
 fs.writeFileSync(path, content);
-EOF
+' "$PLIST"
     REPAIRED=1
   else
     log "OK: plist env vars present"
   fi
 fi
 
-# ── Check 2: auth profile ────────────────────────────────────────────────────
+# ── Check 2: openclaw.json auth profile ──────────────────────────────────────
 if grep -q '"anthropic:claude-cli"' "$CONFIG"; then
   log "OK: anthropic:claude-cli profile present"
 else
   log "WARNING: anthropic:claude-cli profile missing — restoring"
-
-  # Use node to safely patch the JSON (avoids sed mangling)
-  /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$CONFIG" <<'EOF'
-const fs = require('fs');
+  run_node '
+const fs = require("fs");
 const path = process.argv[1];
-const config = JSON.parse(fs.readFileSync(path, 'utf8'));
-
+const config = JSON.parse(fs.readFileSync(path, "utf8"));
 if (!config.auth) config.auth = {};
 if (!config.auth.profiles) config.auth.profiles = {};
-
-config.auth.profiles['anthropic:claude-cli'] = { provider: 'anthropic', mode: 'oauth' };
-
-// Move to front so it takes precedence
-const profiles = { 'anthropic:claude-cli': config.auth.profiles['anthropic:claude-cli'] };
+config.auth.profiles["anthropic:claude-cli"] = { provider: "anthropic", mode: "oauth" };
+const profiles = { "anthropic:claude-cli": config.auth.profiles["anthropic:claude-cli"] };
 for (const [k, v] of Object.entries(config.auth.profiles)) {
-  if (k !== 'anthropic:claude-cli') profiles[k] = v;
+  if (k !== "anthropic:claude-cli") profiles[k] = v;
 }
 config.auth.profiles = profiles;
-
-// Remove bad profiles that cause 401s
-delete config.auth.profiles['anthropic:default'];
-delete config.auth.profiles['anthropic:manual'];
-
+delete config.auth.profiles["anthropic:default"];
+delete config.auth.profiles["anthropic:manual"];
 fs.writeFileSync(path, JSON.stringify(config, null, 2));
-console.log('Patched: anthropic:claude-cli restored');
-EOF
+console.log("Patched: anthropic:claude-cli restored");
+' "$CONFIG"
   REPAIRED=1
 fi
 
-# ── Check 3: auth-profiles.json order array ─────────────────────────────────
-AUTH_PROFILES="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
+# ── Check 3: auth-profiles.json order, expiry, cooldown ──────────────────────
 if [ -f "$AUTH_PROFILES" ]; then
-  # Check if anthropic:claude-cli is FIRST in order.anthropic
-  FIRST_PROFILE=$(/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "
+  FIRST_PROFILE=$("$NODE" -e "
     const p = JSON.parse(require('fs').readFileSync('$AUTH_PROFILES','utf8'));
     const order = p.order && p.order.anthropic;
     console.log(order && order[0] || '');
   " 2>/dev/null)
 
-  # Also check if the claude-cli token is expired
-  CLAUDE_CLI_EXPIRED=$(/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "
+  CLAUDE_CLI_EXPIRED=$("$NODE" -e "
     const p = JSON.parse(require('fs').readFileSync('$AUTH_PROFILES','utf8'));
     const exp = p.profiles && p.profiles['anthropic:claude-cli'] && p.profiles['anthropic:claude-cli'].expires;
     console.log(!exp || exp < Date.now() ? 'yes' : 'no');
   " 2>/dev/null)
 
-  # Also check if claude-cli is in cooldown (openclaw won't use it even if token is valid)
-  CLAUDE_CLI_COOLDOWN=$(/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "
+  CLAUDE_CLI_COOLDOWN=$("$NODE" -e "
     const p = JSON.parse(require('fs').readFileSync('$AUTH_PROFILES','utf8'));
     const stats = p.usageStats && p.usageStats['anthropic:claude-cli'];
     console.log(stats && stats.cooldownUntil && stats.cooldownUntil > Date.now() ? 'yes' : 'no');
@@ -118,40 +110,32 @@ if [ -f "$AUTH_PROFILES" ]; then
   else
     [ "$FIRST_PROFILE" != "anthropic:claude-cli" ] && log "WARNING: auth-profiles.json order wrong (first: '$FIRST_PROFILE') — restoring"
     [ "$CLAUDE_CLI_EXPIRED" = "yes" ] && log "WARNING: auth-profiles.json claude-cli token expired — extending"
-    [ "$CLAUDE_CLI_COOLDOWN" = "yes" ] && log "WARNING: auth-profiles.json claude-cli in cooldown — clearing (proxy token was refreshed, cooldown is stale)"
-    /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$AUTH_PROFILES" <<'EOF'
-const fs = require('fs');
+    [ "$CLAUDE_CLI_COOLDOWN" = "yes" ] && log "WARNING: auth-profiles.json claude-cli in cooldown — clearing"
+    run_node '
+const fs = require("fs");
 const path = process.argv[1];
-const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-
+const data = JSON.parse(fs.readFileSync(path, "utf8"));
 if (!data.order) data.order = {};
-data.order.anthropic = ['anthropic:claude-cli'];
-
+data.order.anthropic = ["anthropic:claude-cli"];
 if (!data.lastGood) data.lastGood = {};
-data.lastGood.anthropic = 'anthropic:claude-cli';
-
-// Extend expiry to 1 year from now
-if (data.profiles && data.profiles['anthropic:claude-cli']) {
-  data.profiles['anthropic:claude-cli'].expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
+data.lastGood.anthropic = "anthropic:claude-cli";
+if (data.profiles && data.profiles["anthropic:claude-cli"]) {
+  data.profiles["anthropic:claude-cli"].expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
 }
-
-// Clear cooldown and error state — once the proxy token is refreshed the
-// cooldown is stale. openclaw won't retry the profile until it's cleared.
-if (data.usageStats && data.usageStats['anthropic:claude-cli']) {
-  delete data.usageStats['anthropic:claude-cli'].cooldownUntil;
-  delete data.usageStats['anthropic:claude-cli'].cooldownReason;
-  data.usageStats['anthropic:claude-cli'].errorCount = 0;
-  delete data.usageStats['anthropic:claude-cli'].failureCounts;
+if (data.usageStats && data.usageStats["anthropic:claude-cli"]) {
+  delete data.usageStats["anthropic:claude-cli"].cooldownUntil;
+  delete data.usageStats["anthropic:claude-cli"].cooldownReason;
+  data.usageStats["anthropic:claude-cli"].errorCount = 0;
+  delete data.usageStats["anthropic:claude-cli"].failureCounts;
 }
-
 fs.writeFileSync(path, JSON.stringify(data, null, 2));
-console.log('Patched: auth-profiles.json order, expiry, and cooldown restored');
-EOF
+console.log("Patched: auth-profiles.json order, expiry, and cooldown restored");
+' "$AUTH_PROFILES"
     REPAIRED=1
   fi
 fi
 
-# ── Restart + alert if anything was repaired ─────────────────────────────────
+# ── Restart + alert if repairs were made ─────────────────────────────────────
 if [ "$REPAIRED" -eq 1 ]; then
   log "Repairs made — reloading gateway plist and restarting"
   launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null
@@ -159,14 +143,20 @@ if [ "$REPAIRED" -eq 1 ]; then
   launchctl bootstrap gui/$UID "$PLIST" 2>/dev/null
   sleep 3
 
-  TELEGRAM_CONFIG="$HOME/.openclaw/credentials/telegram-api.json"
-  if [ -f "$TELEGRAM_CONFIG" ]; then
-    BOT_TOKEN=$(/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "const c=require('$TELEGRAM_CONFIG'); console.log(c.bot_token||c.token||'')" 2>/dev/null)
-    CHAT_ID=$(cat "$HOME/.openclaw/credentials/telegram-allowFrom.json" 2>/dev/null | /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); console.log(Array.isArray(d)?d[0]:d)" 2>/dev/null)
+  CLAWDBOT="$HOME/.openclaw/clawdbot.json"
+  if [ -f "$CLAWDBOT" ]; then
+    BOT_TOKEN=$("$NODE" -e "
+      const d = JSON.parse(require('fs').readFileSync('$CLAWDBOT','utf8'));
+      console.log(d?.channels?.telegram?.botToken || '');
+    " 2>/dev/null)
+    CHAT_ID=$(cat "$HOME/.openclaw/credentials/telegram-allowFrom.json" 2>/dev/null | "$NODE" -e "
+      const d = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+      console.log(d?.allowFrom?.[0] || Array.isArray(d) ? d[0] : d || '');
+    " 2>/dev/null)
     if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
       curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
         -d "chat_id=$CHAT_ID" \
-        -d "text=⚠️ openclaw-auth-watchdog auto-repaired config (openclaw configure likely ran). Gateway restarted. Check that everything is working." \
+        -d "text=⚠️ openclaw-auth-watchdog auto-repaired config. Gateway restarted." \
         > /dev/null
       log "Telegram alert sent"
     fi
@@ -174,15 +164,12 @@ if [ "$REPAIRED" -eq 1 ]; then
 fi
 
 # ── Proactive token refresh + validity check ─────────────────────────────────
-# 1. Ping health to check token state
-# 2. Make a real test request to confirm Anthropic actually accepts the token
-#    (catches server-side invalidation even when local expiry looks fine)
 PROXY_URL="http://127.0.0.1:4523"
 HEALTH=$(curl -s --max-time 5 "$PROXY_URL/health" 2>/dev/null)
+
 if echo "$HEALTH" | grep -q '"token":"valid"'; then
   log "Proxy health: token valid"
 
-  # Verify Anthropic actually accepts the token with a minimal real request
   TEST_BODY='{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"1"}]}'
   TEST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
     -X POST "$PROXY_URL/v1/messages" \
@@ -198,23 +185,20 @@ if echo "$HEALTH" | grep -q '"token":"valid"'; then
     REFRESH_RESULT=$(curl -s --max-time 15 -X POST "$PROXY_URL/force-refresh" 2>/dev/null)
     if echo "$REFRESH_RESULT" | grep -q '"status":"ok"'; then
       log "Token force-refreshed: $REFRESH_RESULT"
-      # Also clear openclaw cooldown — after a 401, openclaw puts claude-cli in
-      # cooldown. Once the token is refreshed the cooldown is stale and must be
-      # cleared or openclaw won't retry the profile.
       if [ -f "$AUTH_PROFILES" ]; then
-        /Users/wizbot/.nvm/versions/node/v22.22.0/bin/node - "$AUTH_PROFILES" <<'EOF'
-const fs = require('fs');
+        run_node '
+const fs = require("fs");
 const path = process.argv[1];
-const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-if (data.usageStats && data.usageStats['anthropic:claude-cli']) {
-  delete data.usageStats['anthropic:claude-cli'].cooldownUntil;
-  delete data.usageStats['anthropic:claude-cli'].cooldownReason;
-  data.usageStats['anthropic:claude-cli'].errorCount = 0;
-  delete data.usageStats['anthropic:claude-cli'].failureCounts;
+const data = JSON.parse(fs.readFileSync(path, "utf8"));
+if (data.usageStats && data.usageStats["anthropic:claude-cli"]) {
+  delete data.usageStats["anthropic:claude-cli"].cooldownUntil;
+  delete data.usageStats["anthropic:claude-cli"].cooldownReason;
+  data.usageStats["anthropic:claude-cli"].errorCount = 0;
+  delete data.usageStats["anthropic:claude-cli"].failureCounts;
 }
 fs.writeFileSync(path, JSON.stringify(data, null, 2));
-console.log('Cleared openclaw cooldown after token refresh');
-EOF
+console.log("Cleared openclaw cooldown after token refresh");
+' "$AUTH_PROFILES"
         log "Cleared openclaw auth cooldown"
       fi
       REPAIRED=1
