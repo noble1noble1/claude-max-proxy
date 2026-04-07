@@ -138,8 +138,8 @@ Both streaming (SSE) and non-streaming responses are handled. Tool references in
 
 Everything. The proxy only modifies auth headers and normalizes the request body. Full support for:
 
-- **Tool use** — `tool_use` / `tool_result` blocks (tool names are normalized in transit and resolved transparently via the symlinks above)
-- **Streaming** — native SSE events, untouched
+- **Tool use** — `tool_use` / `tool_result` blocks pass through with full fidelity; tool names are normalized outbound and restored inbound so OpenClaw always sees original names
+- **Streaming** — SSE events pass through; `data:` payloads containing tool names are rewritten to restore original names before the client receives them
 - **Images / vision** — base64 image blocks
 - **Extended thinking** — thinking blocks pass through
 - **Cache control** — prompt caching headers and stats
@@ -351,6 +351,14 @@ pkill -f "node index.js"
 ```
 
 Then restart the LaunchAgent.
+
+### Subagent spawn stuck in a retry loop ("Tool sess_spawn not found")
+
+This was a proxy bug that is now fixed. The proxy normalized tool names outbound but wasn't restoring them on inbound responses, so OpenClaw received `sess_spawn` instead of `sessions_spawn`, rejected it, and the model kept retrying the same spawn plan.
+
+`git pull` the latest version and restart the proxy. The fix reverses tool renames on all inbound JSON and SSE responses.
+
+**Sessions already stuck in the loop won't recover** — the model has already built a broken recovery plan into the conversation context. Start a fresh session (`/new`) after upgrading the proxy.
 
 ### Still seeing 401s after fixing the root cause
 

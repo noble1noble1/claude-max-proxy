@@ -797,3 +797,8 @@ process.on('SIGINT', () => {
   unwatchFile(CREDENTIALS_PATH);
   process.exit(0);
 });
+
+// Exports for testing
+if (require.main !== module) {
+  module.exports = { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine };
+}
