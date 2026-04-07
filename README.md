@@ -229,7 +229,8 @@ If the token is missing or invalid, the proxy returns a clear error with the act
 | `PORT` | `4523` | Port the proxy listens on |
 | `DEBUG` | `false` | Set to `1` for verbose logging (saves requests to `/tmp/`) |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic API endpoint |
-| `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials |
+| `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials file |
+| `ANTHROPIC_TOKEN` | *(unset)* | Bypass credentials file — set directly to your `sk-ant-oat01-*` token |
 
 ## Endpoints
 

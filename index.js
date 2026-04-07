@@ -34,6 +34,9 @@ const PORT = parseInt(process.env.PORT || '4523', 10);
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
 const ANTHROPIC_BASE = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
 const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claude', '.credentials.json');
+// ANTHROPIC_TOKEN env var: bypass credentials file entirely — set to your sk-ant-oat01-* token directly.
+// Useful when Claude Code stores credentials in macOS Keychain instead of ~/.claude/.credentials.json.
+const ANTHROPIC_TOKEN_OVERRIDE = process.env.ANTHROPIC_TOKEN || null;
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
@@ -55,7 +58,48 @@ function debug(...args) {
 let cachedCredentials = null;
 let refreshInProgress = null;
 
+// Read token from macOS Keychain — fallback for Claude Code 2.1.92+ which may
+// migrate credentials away from ~/.claude/.credentials.json on some machines.
+function readCredentialsFromKeychain() {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const { execFileSync } = require('child_process');
+    const raw = execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (!raw) return null;
+
+    // May be a JSON blob or a raw token string
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed.claudeAiOauth?.accessToken) return parsed.claudeAiOauth;
+      if (parsed.accessToken) return parsed;
+    } catch {
+      // Raw token string
+      if (raw.startsWith('sk-ant-')) {
+        return { accessToken: raw, refreshToken: null, expiresAt: Date.now() + 8 * 60 * 60 * 1000 };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function readCredentials() {
+  // 1. Env var override — highest priority, no file needed
+  if (ANTHROPIC_TOKEN_OVERRIDE) {
+    cachedCredentials = {
+      accessToken: ANTHROPIC_TOKEN_OVERRIDE,
+      refreshToken: null,
+      expiresAt: Date.now() + 8 * 60 * 60 * 1000,
+    };
+    log('Using token from ANTHROPIC_TOKEN env var');
+    return cachedCredentials;
+  }
+
+  // 2. Credentials file (default for most Claude Code installations)
   try {
     const raw = readFileSync(CREDENTIALS_PATH, 'utf-8');
     const parsed = JSON.parse(raw);
@@ -63,13 +107,26 @@ function readCredentials() {
     if (!cachedCredentials?.accessToken) {
       throw new Error('No accessToken found in credentials');
     }
-    debug('Credentials loaded, expires at', new Date(cachedCredentials.expiresAt).toISOString());
+    debug('Credentials loaded from file, expires at', new Date(cachedCredentials.expiresAt).toISOString());
     return cachedCredentials;
   } catch (err) {
-    log('Failed to read credentials:', err.message);
-    log(`Make sure Claude CLI is authenticated: run "claude auth login"`);
-    return null;
+    debug('Credentials file not available:', err.message);
   }
+
+  // 3. macOS Keychain — Claude Code 2.1.92+ on some machines migrates here
+  const keychainCreds = readCredentialsFromKeychain();
+  if (keychainCreds) {
+    cachedCredentials = keychainCreds;
+    log('Credentials loaded from macOS Keychain');
+    return cachedCredentials;
+  }
+
+  log('Failed to read credentials from file or Keychain');
+  log('Options:');
+  log('  A) Run "claude auth login" to re-authenticate');
+  log('  B) Set ANTHROPIC_TOKEN=sk-ant-oat01-... env var with your OAuth token');
+  log('  C) Set CREDENTIALS_PATH to your credentials file location');
+  return null;
 }
 
 function isTokenExpired(creds) {
