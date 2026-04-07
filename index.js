@@ -220,6 +220,20 @@ async function getAccessToken() {
 // refreshes credentials.json but openclaw reads a separate file.
 const AUTH_PROFILES_PATH = join(homedir(), '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
 
+function readFreshToken() {
+  // Try credentials file first, then Keychain — mirrors readCredentials() priority
+  try {
+    const raw = readFileSync(CREDENTIALS_PATH, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (parsed.claudeAiOauth?.accessToken) return parsed.claudeAiOauth;
+  } catch {}
+
+  // Keychain fallback (Claude Code 2.1.92+ on some Macs)
+  const kc = readCredentialsFromKeychain();
+  if (kc?.accessToken) return kc;
+  return null;
+}
+
 function syncAuthProfiles(creds) {
   if (!creds?.accessToken) return;
   try {
@@ -256,7 +270,9 @@ function syncAuthProfiles(creds) {
 watchFile(CREDENTIALS_PATH, { interval: 30_000 }, () => {
   debug('Credentials file changed externally, reloading and syncing');
   readCredentials();
-  if (cachedCredentials) syncAuthProfiles(cachedCredentials);
+  // readFreshToken() also checks Keychain so this works regardless of storage backend
+  const fresh = readFreshToken();
+  if (fresh) syncAuthProfiles(fresh);
 });
 
 // ---------------------------------------------------------------------------

@@ -158,12 +158,14 @@ else
   cp "$WATCHDOG_SRC" "$WATCHDOG_DST"
   chmod +x "$WATCHDOG_DST"
 
-  # Add to crontab if not already present
-  if crontab -l 2>/dev/null | grep -q "openclaw-auth-watchdog"; then
-    echo "Watchdog cron already installed."
+  # Install or upgrade cron — ensure it runs every 15 min (not hourly)
+  CRON_LINE="*/15 * * * * $WATCHDOG_DST >> /tmp/openclaw-auth-watchdog.log 2>&1"
+  if crontab -l 2>/dev/null | grep -q "$CRON_LINE"; then
+    echo "Watchdog cron already installed (every 15 min)."
   else
-    (crontab -l 2>/dev/null; echo "0 * * * * $WATCHDOG_DST >> /tmp/openclaw-auth-watchdog.log 2>&1") | crontab -
-    echo "Watchdog cron installed (runs hourly)."
+    # Remove any old hourly entry and install the 15-min one
+    (crontab -l 2>/dev/null | grep -v "openclaw-auth-watchdog"; echo "$CRON_LINE") | crontab -
+    echo "Watchdog cron installed (runs every 15 min)."
   fi
 fi
 
