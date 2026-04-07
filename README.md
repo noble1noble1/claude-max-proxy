@@ -115,6 +115,25 @@ ln -sf ~/clawd/SOUL.md ~/clawd/PERSONA.md
 ln -sf ~/clawd/HEARTBEAT.md ~/clawd/STATUSCHECK.md
 ```
 
+## Tool name normalization
+
+The proxy normalizes OpenClaw tool names in outbound requests and restores them on inbound responses. This is transparent — OpenClaw registers tools under their original names and receives them back under those same names.
+
+| Original | Normalized (in transit) |
+|----------|------------------------|
+| `sessions_spawn` | `sess_spawn` |
+| `sessions_send` | `sess_send` |
+| `sessions_list` | `sess_list` |
+| `sessions_history` | `sess_history` |
+| `sessions_yield` | `sess_yield` |
+| `session_status` | `sess_status` |
+| `memory_search` | `mem_search` |
+| `memory_get` | `mem_get` |
+| `subagents` | `sub_agents` |
+| `cron` | `scheduler` |
+
+Both streaming (SSE) and non-streaming responses are handled. Tool references inside `tool_use` blocks in message history are also normalized outbound.
+
 ## What passes through
 
 Everything. The proxy only modifies auth headers and normalizes the request body. Full support for:
