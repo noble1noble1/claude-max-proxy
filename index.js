@@ -540,6 +540,13 @@ function makeRequest(targetUrl, method, headers, payload) {
         });
         return;
       }
+      if (proxyRes.statusCode === 401) {
+        // Consume body then signal token refresh + retry
+        let body = '';
+        proxyRes.on('data', (d) => { body += d; });
+        proxyRes.on('end', () => resolve({ retry401: true, body }));
+        return;
+      }
       resolve({ retry: false, proxyRes });
     });
     proxyReq.on('error', reject);
@@ -605,7 +612,7 @@ function forwardRequest(req, res, body) {
       targetUrl.search = req.url.split('?')[1];
     }
 
-    const headers = buildHeaders(accessToken, req);
+    let headers = buildHeaders(accessToken, req);
 
     const payload = body ? JSON.stringify(body) : undefined;
     if (payload) {
@@ -627,6 +634,31 @@ function forwardRequest(req, res, body) {
             error: { type: 'api_error', message: `Proxy error: ${err.message}` },
           });
         }
+        return resolve();
+      }
+
+      if (result.retry401 && attempt === 0) {
+        // Anthropic rejected our token — force-refresh and retry once
+        log('401 from Anthropic — token invalidated server-side, force-refreshing and retrying');
+        try {
+          cachedCredentials = null; // force re-read + refresh
+          const freshCreds = await refreshToken(await (async () => { readCredentials(); return cachedCredentials; })());
+          accessToken = freshCreds.accessToken;
+          syncAuthProfiles(freshCreds);
+          headers = buildHeaders(accessToken, req);
+          if (payload) headers['content-length'] = Buffer.byteLength(payload);
+        } catch (err) {
+          log('Token refresh after 401 failed:', err.message);
+          res.status(401).json(JSON.parse(result.body));
+          return resolve();
+        }
+        continue;
+      }
+
+      if (result.retry401) {
+        // Already retried once, still 401 — return the error
+        log('401 persisted after token refresh — credentials may need re-login');
+        res.status(401).json(JSON.parse(result.body));
         return resolve();
       }
 
