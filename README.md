@@ -13,7 +13,7 @@ Your App  →  claude-max-proxy :4523  →  api.anthropic.com
 
 **What the proxy does on each request:**
 1. Reads your OAuth token from `~/.claude/.credentials.json` (or macOS Keychain)
-2. Injects the Claude Code billing attribution header into the system prompt
+2. Rewrites the system prompt to match the exact structure Anthropic's billing classifier expects for first-party Claude Code sessions: only `[CC-preamble, billing-header]`. Any extra app context blocks are moved into the first user message as `<system>…</system>` so the model still receives them.
 3. Normalizes app-specific strings and tool names to a standard format
 4. Forwards to Anthropic with your credentials
 5. Streams the response back untouched
@@ -280,11 +280,14 @@ Or just run `./setup.sh` which does this automatically.
 
 ### HTTP 400 "You're out of extra usage"
 
-This means requests are reaching Anthropic without your subscription credentials — the proxy is either not running or not being called.
+Anthropic's billing classifier rejected the request as a third-party app rather than a first-party Claude Code session. There are two possible causes:
 
+**Proxy not routing correctly** — requests bypass the proxy entirely:
 1. Confirm the proxy is running: `curl http://127.0.0.1:4523/health`
-2. Confirm your app is routing through it: watch proxy logs with `tail -f /tmp/claude-max-proxy.log` while sending a request — you should see `POST /v1/messages`
+2. Watch proxy logs while sending a request — you should see `POST /v1/messages`: `tail -f ~/.openclaw/logs/claude-max-proxy.log`
 3. For OpenClaw: verify `openclaw.json` has both `baseUrl` and the `models` array (see App Configuration above)
+
+**Billing classifier detecting third-party identity** — requests go through the proxy but Anthropic still rejects them. This happens when the app adds extra system blocks that reveal its non-Claude-Code identity (e.g. `"You are a personal assistant running on myapp"`). The proxy v2.1+ automatically strips these extra blocks and moves them into the user message, so this should be handled transparently. If you're on an older version, update and restart.
 
 ### HTTP 401 with a valid token
 
