@@ -483,22 +483,27 @@ function rewriteSystemForBillingClassifier(body) {
     originalBlocks = result.system;
   }
 
-  // If already a Claude Code session, just ensure billing header block is present
+  // If already a Claude Code session, ensure billing header is at position [1]
   const firstText = originalBlocks.find(b => b.type === 'text')?.text || '';
   if (firstText.startsWith('You are Claude Code,')) {
-    const hasBillingHeader = originalBlocks.some(
+    const billingIdx = originalBlocks.findIndex(
       b => b.type === 'text' && b.text?.startsWith('x-anthropic-billing-header:')
     );
-    if (!hasBillingHeader) {
-      // Insert billing header as block [1] — right after the Claude Code preamble.
-      // Appending at the end fails for long system arrays because Anthropic's
-      // classifier only scans the first few blocks.
-      result.system = [
-        originalBlocks[0],
-        { type: 'text', text: buildBillingHeader() },
-        ...originalBlocks.slice(1),
-      ];
+    if (billingIdx === 1) {
+      // Already correct — billing header at [1], nothing to do.
+      return result;
     }
+    // Remove any existing billing block (it may be at the wrong position) then
+    // insert a fresh one at [1], right after the Claude Code preamble block.
+    // Anthropic's classifier only scans the first 2–3 blocks, so position matters.
+    const blocksWithoutBilling = billingIdx >= 0
+      ? originalBlocks.filter((_, i) => i !== billingIdx)
+      : originalBlocks;
+    result.system = [
+      blocksWithoutBilling[0],
+      { type: 'text', text: buildBillingHeader() },
+      ...blocksWithoutBilling.slice(1),
+    ];
     return result;
   }
 
@@ -825,7 +830,19 @@ app.post('/v1/messages', async (req, res) => {
   const stream = !!sanitizedBody.stream;
   const msgCount = sanitizedBody.messages?.length || 0;
 
-  log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount}`);
+  // Log system block summary so we can verify billing header injection
+  const sysBlocks = sanitizedBody.system;
+  let sysInfo;
+  if (!sysBlocks) {
+    sysInfo = 'no-system';
+  } else if (typeof sysBlocks === 'string') {
+    sysInfo = 'string:' + sysBlocks.slice(0, 30);
+  } else {
+    const billingPos = sysBlocks.findIndex(b => b.type === 'text' && b.text?.startsWith('x-anthropic-billing-header:'));
+    const preview = sysBlocks.map((b, i) => `[${i}]${(b.text || b.type || '?').slice(0, 20).replace(/\n/g, ' ')}`).join(' ');
+    sysInfo = `blocks[${sysBlocks.length}] billing@${billingPos}: ${preview}`;
+  }
+  log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount} | sys=${sysInfo}`);
 
   // Verify sanitization — scan only the fields we actually sanitize.
   // tool_result blocks are intentionally excluded from sanitization (exec output),
