@@ -270,10 +270,39 @@ function syncAuthProfiles(creds) {
 watchFile(CREDENTIALS_PATH, { interval: 30_000 }, () => {
   debug('Credentials file changed externally, reloading and syncing');
   readCredentials();
-  // readFreshToken() also checks Keychain so this works regardless of storage backend
   const fresh = readFreshToken();
   if (fresh) syncAuthProfiles(fresh);
+  scheduleProactiveRefresh(); // reschedule based on new expiry
 });
+
+// Proactive token refresh — refreshes 10 minutes before expiry so requests
+// never hit an expired token. Without this, the proxy only refreshes on the
+// next incoming request, which arrives after the token is already dead.
+let proactiveRefreshTimer = null;
+
+function scheduleProactiveRefresh() {
+  if (proactiveRefreshTimer) clearTimeout(proactiveRefreshTimer);
+  if (!cachedCredentials?.expiresAt || !cachedCredentials?.refreshToken) return;
+
+  const refreshAt = cachedCredentials.expiresAt - 10 * 60 * 1000; // 10 min before expiry
+  const delayMs = Math.max(refreshAt - Date.now(), 60_000); // at least 1 min from now
+
+  proactiveRefreshTimer = setTimeout(async () => {
+    try {
+      log('[proactive-refresh] Token nearing expiry, refreshing preemptively...');
+      const refreshed = await refreshToken(cachedCredentials);
+      log(`[proactive-refresh] Success, new expiry: ${new Date(refreshed.expiresAt).toISOString()}`);
+      scheduleProactiveRefresh(); // schedule the next one
+    } catch (err) {
+      log(`[proactive-refresh] Failed: ${err.message} — will retry in 5 min`);
+      proactiveRefreshTimer = setTimeout(() => scheduleProactiveRefresh(), 5 * 60 * 1000);
+    }
+  }, delayMs);
+
+  proactiveRefreshTimer.unref(); // don't prevent process exit
+  const refreshTime = new Date(Date.now() + delayMs).toISOString();
+  debug(`[proactive-refresh] Scheduled for ${refreshTime} (${Math.round(delayMs / 60000)} min from now)`);
+}
 
 // ---------------------------------------------------------------------------
 // Prompt sanitization
@@ -991,8 +1020,9 @@ app.post('/force-refresh', async (req, res) => {
 // Start
 // ---------------------------------------------------------------------------
 
-// Load credentials on startup
+// Load credentials on startup and schedule proactive refresh
 readCredentials();
+scheduleProactiveRefresh();
 
 app.listen(PORT, '127.0.0.1', () => {
   log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
