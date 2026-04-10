@@ -399,12 +399,9 @@ function sanitizeRequest(body) {
               const newBlock = { ...block };
               if (typeof newBlock.text === 'string') newBlock.text = sanitizeString(newBlock.text);
               if (typeof newBlock.content === 'string') newBlock.content = sanitizeString(newBlock.content);
+              // Deep sanitize tool input (handles nested objects like edit new_string)
               if (newBlock.input && typeof newBlock.input === 'object') {
-                newBlock.input = Object.fromEntries(
-                  Object.entries(newBlock.input).map(([k, v]) =>
-                    [k, typeof v === 'string' ? sanitizeString(v) : v]
-                  )
-                );
+                newBlock.input = JSON.parse(sanitizeString(JSON.stringify(newBlock.input)));
               }
               return newBlock;
             }
