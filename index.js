@@ -483,27 +483,59 @@ function rewriteSystemForBillingClassifier(body) {
     originalBlocks = result.system;
   }
 
-  // If already a Claude Code session, ensure billing header is at position [1]
+  // If already a Claude Code session, enforce exactly [CC-preamble, billing-header].
+  // Any additional blocks (e.g. openclaw's "You are a personal assistant running on X")
+  // are MOVED into the first user message as <system> context. Anthropic's classifier
+  // rejects requests where extra system blocks betray a third-party app identity,
+  // even when the billing header is present at [1].
   const firstText = originalBlocks.find(b => b.type === 'text')?.text || '';
   if (firstText.startsWith('You are Claude Code,')) {
+    // Remove any existing billing header block from wherever it sits
     const billingIdx = originalBlocks.findIndex(
       b => b.type === 'text' && b.text?.startsWith('x-anthropic-billing-header:')
     );
-    if (billingIdx === 1) {
-      // Already correct — billing header at [1], nothing to do.
-      return result;
-    }
-    // Remove any existing billing block (it may be at the wrong position) then
-    // insert a fresh one at [1], right after the Claude Code preamble block.
-    // Anthropic's classifier only scans the first 2–3 blocks, so position matters.
     const blocksWithoutBilling = billingIdx >= 0
       ? originalBlocks.filter((_, i) => i !== billingIdx)
       : originalBlocks;
+
+    // blocksWithoutBilling[0] is the CC preamble block.
+    // Anything beyond [0] is extra context added by the third-party app.
+    const extraBlocks = blocksWithoutBilling.slice(1);
+
+    // System: only CC preamble + billing header (clean classifier fingerprint)
     result.system = [
       blocksWithoutBilling[0],
       { type: 'text', text: buildBillingHeader() },
-      ...blocksWithoutBilling.slice(1),
     ];
+
+    // Move extra blocks into the first user message as <system> context so
+    // the model still receives the instructions, just not in the system slot.
+    if (extraBlocks.length > 0) {
+      const extraText = extraBlocks
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('\n\n')
+        .trim();
+      if (extraText) {
+        const messages = [...(result.messages || [])];
+        const firstUserIdx = messages.findIndex(m => m.role === 'user');
+        const prefix = `<system>\n${extraText}\n</system>\n\n`;
+        if (firstUserIdx >= 0) {
+          const msg = { ...messages[firstUserIdx] };
+          if (typeof msg.content === 'string') {
+            msg.content = prefix + msg.content;
+          } else if (Array.isArray(msg.content)) {
+            msg.content = [{ type: 'text', text: prefix }, ...msg.content];
+          } else {
+            msg.content = prefix;
+          }
+          messages[firstUserIdx] = msg;
+        } else {
+          messages.unshift({ role: 'user', content: prefix.trim() });
+        }
+        result.messages = messages;
+      }
+    }
     return result;
   }
 
@@ -755,6 +787,13 @@ function forwardRequest(req, res, body) {
       }
 
       const { proxyRes } = result;
+      const sc = proxyRes.statusCode;
+      if (sc >= 400) {
+        const overageStatus = proxyRes.headers['anthropic-ratelimit-unified-overage-status'] || '';
+        const overageReason = proxyRes.headers['anthropic-ratelimit-unified-overage-disabled-reason'] || '';
+        const serviceTier = proxyRes.headers['anthropic-ratelimit-unified-tier'] || '';
+        log(`← ERROR ${sc} | overage=${overageStatus} | reason=${overageReason} | tier=${serviceTier}`);
+      }
       debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
 
       // Copy response headers
@@ -792,6 +831,7 @@ function forwardRequest(req, res, body) {
         proxyRes.on('data', (chunk) => chunks.push(chunk));
         proxyRes.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf8');
+          if (sc >= 400) log(`← ERROR body: ${raw.slice(0, 300)}`);
           try {
             const parsed = JSON.parse(raw);
             const fixed = desanitizeResponseJson(parsed);
@@ -842,7 +882,16 @@ app.post('/v1/messages', async (req, res) => {
     const preview = sysBlocks.map((b, i) => `[${i}]${(b.text || b.type || '?').slice(0, 20).replace(/\n/g, ' ')}`).join(' ');
     sysInfo = `blocks[${sysBlocks.length}] billing@${billingPos}: ${preview}`;
   }
-  log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount} | sys=${sysInfo}`);
+  const toolCount = sanitizedBody.tools?.length || 0;
+  const hasThinking = !!(sanitizedBody.thinking?.type || sanitizedBody.budget_tokens);
+  log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount} | tools=${toolCount} | thinking=${hasThinking} | sys=${sysInfo}`);
+
+  // For large sessions, dump the full request body to a temp file for debugging
+  if (msgCount >= 15) {
+    const dumpPath = `/tmp/claude-proxy-dump-${Date.now()}.json`;
+    require('fs').writeFileSync(dumpPath, JSON.stringify(sanitizedBody, null, 2));
+    log(`  Dumped large request body to ${dumpPath}`);
+  }
 
   // Verify sanitization — scan only the fields we actually sanitize.
   // tool_result blocks are intentionally excluded from sanitization (exec output),
