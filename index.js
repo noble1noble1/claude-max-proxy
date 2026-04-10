@@ -490,9 +490,13 @@ function rewriteSystemForBillingClassifier(body) {
       b => b.type === 'text' && b.text?.startsWith('x-anthropic-billing-header:')
     );
     if (!hasBillingHeader) {
+      // Insert billing header as block [1] — right after the Claude Code preamble.
+      // Appending at the end fails for long system arrays because Anthropic's
+      // classifier only scans the first few blocks.
       result.system = [
-        ...originalBlocks,
+        originalBlocks[0],
         { type: 'text', text: buildBillingHeader() },
+        ...originalBlocks.slice(1),
       ];
     }
     return result;
