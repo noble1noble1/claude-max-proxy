@@ -483,9 +483,18 @@ function rewriteSystemForBillingClassifier(body) {
     originalBlocks = result.system;
   }
 
-  // No-op: already a Claude Code session
+  // If already a Claude Code session, just ensure billing header block is present
   const firstText = originalBlocks.find(b => b.type === 'text')?.text || '';
   if (firstText.startsWith('You are Claude Code,')) {
+    const hasBillingHeader = originalBlocks.some(
+      b => b.type === 'text' && b.text?.startsWith('x-anthropic-billing-header:')
+    );
+    if (!hasBillingHeader) {
+      result.system = [
+        ...originalBlocks,
+        { type: 'text', text: buildBillingHeader() },
+      ];
+    }
     return result;
   }
 
