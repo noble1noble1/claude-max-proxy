@@ -1,11 +1,15 @@
 #!/bin/bash
 # openclaw-auth-watchdog
-# Runs hourly. Checks and repairs openclaw auth config, proxy token, and cooldown state.
+# Runs every 15 min. Checks and repairs openclaw auth config, proxy token, and cooldown state.
+# REPAIRED=1 means auth files were patched (does NOT restart gateway on its own).
+# GATEWAY_NEEDS_RESTART=1 means the gateway is actually unresponsive and needs a kick.
+# Separating these prevents unnecessary gateway restarts for routine auth file repairs.
 
 CONFIG="$HOME/.openclaw/openclaw.json"
 PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 LOG="/tmp/openclaw-auth-watchdog.log"
 REPAIRED=0
+GATEWAY_NEEDS_RESTART=0
 NODE=/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node
 AUTH_PROFILES="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
 
@@ -179,24 +183,29 @@ if [ "$GATEWAY_STATUS" = "200" ] || [ "$GATEWAY_STATUS" = "401" ]; then
   log "OK: gateway responding (HTTP $GATEWAY_STATUS)"
 else
   GATEWAY_ALIVE=0
+  GATEWAY_NEEDS_RESTART=1
   log "WARNING: gateway not responding (HTTP $GATEWAY_STATUS) — will restart"
-  REPAIRED=1
 fi
 
-# ── Restart gateway if needed ─────────────────────────────────────────────────
-if [ "$REPAIRED" -eq 1 ]; then
-  log "Restarting gateway"
+# ── Restart gateway only if it is actually unresponsive ──────────────────────
+# Auth file repairs (REPAIRED=1) do NOT require a gateway restart — the gateway
+# picks up config changes on its own. Only restart when the process is dead/hung.
+if [ "$GATEWAY_NEEDS_RESTART" -eq 1 ]; then
+  log "Restarting gateway (was unresponsive)"
   launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null
   sleep 2
   launchctl bootstrap gui/$UID "$PLIST" 2>/dev/null
   sleep 3
+  REPAIRED=1
+elif [ "$REPAIRED" -eq 1 ]; then
+  log "Auth files repaired — gateway left running (no restart needed)"
 else
   log "OK: gateway healthy, no restart needed"
 fi
 
 # ── Alert if repairs were made ────────────────────────────────────────────────
 if [ "$REPAIRED" -eq 1 ]; then
-  log "Repairs made — gateway restarted"
+  log "Repairs made — gateway $([ "$GATEWAY_NEEDS_RESTART" -eq 1 ] && echo 'restarted' || echo 'left running')"
 
   CLAWDBOT="$HOME/.openclaw/clawdbot.json"
   if [ -f "$CLAWDBOT" ]; then
