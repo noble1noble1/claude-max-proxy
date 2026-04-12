@@ -37,15 +37,16 @@ const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claud
 // ANTHROPIC_TOKEN env var: bypass credentials file entirely — set to your sk-ant-oat01-* token directly.
 // Useful when Claude Code stores credentials in macOS Keychain instead of ~/.claude/.credentials.json.
 const ANTHROPIC_TOKEN_OVERRIDE = process.env.ANTHROPIC_TOKEN || null;
-// AUTH_HEADER_FORMAT: 'x-api-key' (default) or 'bearer'.
-// Most setups work with x-api-key. Some macOS Keychain-sourced tokens require Authorization: Bearer.
-// If you get 401 invalid x-api-key with a valid sk-ant-oat01-* token, try: AUTH_HEADER_FORMAT=bearer
-const AUTH_HEADER_FORMAT = (process.env.AUTH_HEADER_FORMAT || 'x-api-key').toLowerCase();
+// AUTH_HEADER_FORMAT: 'bearer' (default) or 'x-api-key'.
+// OAuth tokens (sk-ant-oat01-*) require Authorization: Bearer — sending them as x-api-key
+// causes "invalid x-api-key" 401s. Override with AUTH_HEADER_FORMAT=x-api-key only if
+// using a legacy sk-ant-api03-* key.
+const AUTH_HEADER_FORMAT = (process.env.AUTH_HEADER_FORMAT || 'bearer').toLowerCase();
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 const { randomUUID } = require('crypto');
-const PROXY_SESSION_ID = randomUUID();
+let PROXY_SESSION_ID = randomUUID();
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -617,6 +618,56 @@ function rewriteSystemForBillingClassifier(body) {
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 2000;
 
+// ---------------------------------------------------------------------------
+// Circuit breaker — prevents hammering Anthropic when auth is broken.
+//
+// When Anthropic repeatedly rejects tokens, forwarding every incoming request
+// makes the outage longer. The circuit breaker stops forwarding after
+// THRESHOLD consecutive full failures, returns 503 immediately to clients,
+// then probes again after COOLDOWN_MS.
+//
+// States: closed (normal) → open (blocking) → half-open (one probe) → closed
+// ---------------------------------------------------------------------------
+
+const circuit = {
+  state: 'closed',
+  failures: 0,
+  openedAt: null,
+  THRESHOLD: 3,
+  COOLDOWN_MS: 60_000,
+};
+
+function circuitAllow() {
+  if (circuit.state === 'closed') return { ok: true };
+  if (circuit.state === 'open') {
+    const elapsed = Date.now() - circuit.openedAt;
+    if (elapsed >= circuit.COOLDOWN_MS) {
+      circuit.state = 'half-open';
+      log(`[circuit] half-open — probing after ${Math.round(elapsed / 1000)}s cooldown`);
+      return { ok: true };
+    }
+    return { ok: false, retryAfter: Math.ceil((circuit.COOLDOWN_MS - elapsed) / 1000) };
+  }
+  return { ok: true }; // half-open: allow the probe through
+}
+
+function circuitSuccess() {
+  if (circuit.state !== 'closed') log(`[circuit] closed — auth restored`);
+  circuit.state = 'closed';
+  circuit.failures = 0;
+  circuit.openedAt = null;
+}
+
+function circuitFailure() {
+  circuit.failures++;
+  if (circuit.failures >= circuit.THRESHOLD) {
+    const wasOpen = circuit.state === 'open';
+    circuit.state = 'open';
+    circuit.openedAt = Date.now();
+    if (!wasOpen) log(`[circuit] OPEN — ${circuit.failures} consecutive auth failures, blocking for ${circuit.COOLDOWN_MS / 1000}s`);
+  }
+}
+
 // Beta flags required for OAuth + Claude Code features — always injected
 // regardless of what the client sends, so the proxy never silently breaks
 // if openclaw stops sending one of these.
@@ -677,10 +728,15 @@ function makeRequest(targetUrl, method, headers, payload) {
         return;
       }
       if (proxyRes.statusCode === 401) {
-        // Consume body then signal token refresh + retry
+        const wwwAuth = proxyRes.headers['www-authenticate'] || '';
         let body = '';
         proxyRes.on('data', (d) => { body += d; });
-        proxyRes.on('end', () => resolve({ retry401: true, body }));
+        proxyRes.on('end', () => {
+          let errMsg = '';
+          try { errMsg = JSON.parse(body)?.error?.message || ''; } catch {}
+          log(`[401] anthropic_says="${errMsg}"${wwwAuth ? ` www-authenticate="${wwwAuth}"` : ''}`);
+          resolve({ retry401: true, body });
+        });
         return;
       }
       resolve({ retry: false, proxyRes });
@@ -727,6 +783,21 @@ function desanitizeSseLine(line) {
 
 function forwardRequest(req, res, body) {
   return new Promise(async (resolve) => {
+    // Circuit breaker — reject immediately if auth is known-broken
+    const circuitState = circuitAllow();
+    if (!circuitState.ok) {
+      log(`[circuit] open — rejecting request, retry after ${circuitState.retryAfter}s`);
+      res.set('Retry-After', String(circuitState.retryAfter));
+      res.status(503).json({
+        type: 'error',
+        error: {
+          type: 'circuit_open',
+          message: `Auth temporarily unavailable — retrying in ${circuitState.retryAfter}s`,
+        },
+      });
+      return resolve();
+    }
+
     let accessToken;
     try {
       accessToken = await getAccessToken();
@@ -776,10 +847,11 @@ function forwardRequest(req, res, body) {
       if (result.retry401) {
         // Anthropic's token invalidation has eventual consistency — freshly
         // refreshed tokens can be rejected for 30-60s while edge servers sync.
-        // Strategy: refresh once, then retry with exponential backoff up to ~60s.
+        // Strategy: refresh + rotate session on first 401, then backoff retries.
+        // Circuit breaker trips after THRESHOLD consecutive total failures.
         if (attempt === 0) {
-          // First 401: refresh the token
-          log(`401: token rejected (${accessToken.slice(0, 15)}...), refreshing...`);
+          // First 401: refresh token + rotate session ID
+          log(`[401] attempt=1 token=${accessToken.slice(0, 15)}... — refreshing + rotating session`);
           try {
             cachedCredentials = null;
             readCredentials();
@@ -788,12 +860,14 @@ function forwardRequest(req, res, body) {
             }
             const freshCreds = await refreshToken(cachedCredentials);
             accessToken = freshCreds.accessToken;
+            PROXY_SESSION_ID = randomUUID();
             syncAuthProfiles(freshCreds);
             headers = buildHeaders(accessToken, req);
             if (payload) headers['content-length'] = Buffer.byteLength(payload);
-            log(`401: refreshed to ${accessToken.slice(0, 15)}..., retrying immediately`);
+            log(`[401] retry: new_token=${accessToken.slice(0, 15)}... new_session=${PROXY_SESSION_ID.slice(0, 8)}`);
           } catch (err) {
-            log('401: token refresh failed:', err.message);
+            log(`[401] token refresh failed: ${err.message}`);
+            circuitFailure();
             res.status(401).json(JSON.parse(result.body));
             return resolve();
           }
@@ -801,15 +875,16 @@ function forwardRequest(req, res, body) {
         }
 
         if (attempt <= MAX_RETRIES) {
-          // Subsequent 401s: same (refreshed) token, just wait for propagation
+          // Subsequent 401s: token propagation delay — wait and retry
           const delayMs = RETRY_BASE_MS * Math.pow(2, attempt - 1); // 2s, 4s, 8s
-          log(`401: token not yet propagated, waiting ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
+          log(`[401] attempt=${attempt + 1} — propagation delay, waiting ${delayMs}ms`);
           await new Promise(r => setTimeout(r, delayMs));
           continue;
         }
 
-        // Exhausted all retries
-        log(`401: exhausted ${MAX_RETRIES + 1} attempts — token may be permanently invalid`);
+        // Exhausted all retries — trip the circuit breaker
+        log(`[401] exhausted all retries — tripping circuit breaker (failure #${circuit.failures + 1})`);
+        circuitFailure();
         res.status(401).json(JSON.parse(result.body));
         return resolve();
       }
@@ -846,6 +921,9 @@ function forwardRequest(req, res, body) {
         }
       }
       res.status(proxyRes.statusCode);
+
+      // Successful response — reset circuit breaker
+      if (proxyRes.statusCode < 400) circuitSuccess();
 
       const contentType = proxyRes.headers['content-type'] || '';
       const isSSE = contentType.includes('text/event-stream');
@@ -1004,6 +1082,8 @@ app.get('/health', async (req, res) => {
     token: tokenStatus,
     subscription: sub,
     rateLimitTier: cachedCredentials?.rateLimitTier || 'unknown',
+    circuit: circuit.state,
+    ...(circuit.state !== 'closed' ? { circuitFailures: circuit.failures } : {}),
     ...(isMax ? {} : { warning: 'Not a Max subscription — requests will be billed as standard API usage' }),
   });
 });
