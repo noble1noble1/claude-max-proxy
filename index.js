@@ -773,27 +773,43 @@ function forwardRequest(req, res, body) {
         return resolve();
       }
 
-      if (result.retry401 && attempt === 0) {
-        // Anthropic rejected our token — force-refresh and retry once
-        log('401 from Anthropic — token invalidated server-side, force-refreshing and retrying');
-        try {
-          cachedCredentials = null; // force re-read + refresh
-          const freshCreds = await refreshToken(await (async () => { readCredentials(); return cachedCredentials; })());
-          accessToken = freshCreds.accessToken;
-          syncAuthProfiles(freshCreds);
-          headers = buildHeaders(accessToken, req);
-          if (payload) headers['content-length'] = Buffer.byteLength(payload);
-        } catch (err) {
-          log('Token refresh after 401 failed:', err.message);
-          res.status(401).json(JSON.parse(result.body));
-          return resolve();
-        }
-        continue;
-      }
-
       if (result.retry401) {
-        // Already retried once, still 401 — return the error
-        log('401 persisted after token refresh — credentials may need re-login');
+        // Anthropic's token invalidation has eventual consistency — freshly
+        // refreshed tokens can be rejected for 30-60s while edge servers sync.
+        // Strategy: refresh once, then retry with exponential backoff up to ~60s.
+        if (attempt === 0) {
+          // First 401: refresh the token
+          log(`401: token rejected (${accessToken.slice(0, 15)}...), refreshing...`);
+          try {
+            cachedCredentials = null;
+            readCredentials();
+            if (!cachedCredentials?.refreshToken) {
+              throw new Error('No refresh token available');
+            }
+            const freshCreds = await refreshToken(cachedCredentials);
+            accessToken = freshCreds.accessToken;
+            syncAuthProfiles(freshCreds);
+            headers = buildHeaders(accessToken, req);
+            if (payload) headers['content-length'] = Buffer.byteLength(payload);
+            log(`401: refreshed to ${accessToken.slice(0, 15)}..., retrying immediately`);
+          } catch (err) {
+            log('401: token refresh failed:', err.message);
+            res.status(401).json(JSON.parse(result.body));
+            return resolve();
+          }
+          continue;
+        }
+
+        if (attempt <= MAX_RETRIES) {
+          // Subsequent 401s: same (refreshed) token, just wait for propagation
+          const delayMs = RETRY_BASE_MS * Math.pow(2, attempt - 1); // 2s, 4s, 8s
+          log(`401: token not yet propagated, waiting ${delayMs}ms (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
+          await new Promise(r => setTimeout(r, delayMs));
+          continue;
+        }
+
+        // Exhausted all retries
+        log(`401: exhausted ${MAX_RETRIES + 1} attempts — token may be permanently invalid`);
         res.status(401).json(JSON.parse(result.body));
         return resolve();
       }
