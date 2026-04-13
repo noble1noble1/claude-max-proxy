@@ -397,6 +397,65 @@ function sanitizeRequest(body) {
     }
   }
 
+  // Fix max_tokens: must be >= 1. OpenClaw sometimes sends 0 or negative
+  // values when token budget is exhausted, which Anthropic rejects.
+  if (result.max_tokens !== undefined && result.max_tokens < 1) {
+    debug(`Fixed max_tokens: ${result.max_tokens} → 1024`);
+    result.max_tokens = 1024;
+  }
+
+  // Repair broken tool_use / tool_result pairing. The API requires that
+  // every tool_use block in an assistant message has a matching tool_result
+  // in the immediately following user message, and vice versa. OpenClaw's
+  // lossless-claw context compaction can break this invariant when it trims
+  // messages mid-conversation. We fix it by:
+  //   1. Collecting tool_use IDs from each assistant message
+  //   2. Checking the next user message has matching tool_result blocks
+  //   3. Injecting stub tool_results for any orphaned tool_use blocks
+  //   4. Removing tool_result blocks that reference non-existent tool_use IDs
+  if (Array.isArray(result.messages) && result.messages.length >= 2) {
+    for (let i = 0; i < result.messages.length - 1; i++) {
+      const msg = result.messages[i];
+      const next = result.messages[i + 1];
+      if (msg.role !== 'assistant' || next.role !== 'user') continue;
+      if (!Array.isArray(msg.content) || !Array.isArray(next.content)) continue;
+
+      const toolUseIds = new Set();
+      for (const block of msg.content) {
+        if (block?.type === 'tool_use' && block.id) toolUseIds.add(block.id);
+      }
+      if (toolUseIds.size === 0) continue;
+
+      const existingResultIds = new Set();
+      for (const block of next.content) {
+        if (block?.type === 'tool_result' && block.tool_use_id) {
+          existingResultIds.add(block.tool_use_id);
+        }
+      }
+
+      // Inject stub results for orphaned tool_use blocks
+      for (const id of toolUseIds) {
+        if (!existingResultIds.has(id)) {
+          debug(`Injected stub tool_result for orphaned tool_use ${id}`);
+          next.content.push({
+            type: 'tool_result',
+            tool_use_id: id,
+            content: '[result unavailable — context was compacted]',
+          });
+        }
+      }
+
+      // Remove tool_results that reference non-existent tool_use IDs
+      next.content = next.content.filter(block => {
+        if (block?.type === 'tool_result' && block.tool_use_id && !toolUseIds.has(block.tool_use_id)) {
+          debug(`Removed orphaned tool_result referencing unknown tool_use ${block.tool_use_id}`);
+          return false;
+        }
+        return true;
+      });
+    }
+  }
+
   // Sanitize system prompt with extra patterns
   if (typeof result.system === 'string') {
     result.system = sanitizeString(result.system, true);
