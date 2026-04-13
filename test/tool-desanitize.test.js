@@ -1,5 +1,6 @@
 /**
- * Regression tests for tool name normalization round-trip.
+ * Regression tests for tool name normalization round-trip and
+ * Anthropic error classification.
  *
  * The proxy renames OpenClaw tools outbound and must restore original
  * names on inbound Anthropic responses (both JSON and SSE).
@@ -12,7 +13,13 @@
 const assert = require('assert');
 
 // ── Pull the maps directly from the proxy ────────────────────────────────────
-const { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine } = require('../index.js');
+const {
+  TOOL_RENAMES,
+  TOOL_RENAMES_REVERSE,
+  desanitizeResponseJson,
+  desanitizeSseLine,
+  classifyAnthropicError,
+} = require('../index.js');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function makeToolUseJson(name) {
@@ -139,6 +146,60 @@ test('SSE: unknown tool names pass through unchanged', () => {
   const fixed = desanitizeSseLine(line);
   const evt = JSON.parse(fixed.slice(6));
   assert.strictEqual(evt.content_block.name, 'some_other_tool');
+});
+
+// ── Error classification tests ────────────────────────────────────────────────
+console.log('\nAnthropicError classification');
+
+test('classifyAnthropicError: 401 → auth', () => {
+  assert.strictEqual(classifyAnthropicError(401, '', {}), 'auth');
+});
+
+test('classifyAnthropicError: 429 → ratelimit', () => {
+  assert.strictEqual(classifyAnthropicError(429, '', {}), 'ratelimit');
+});
+
+test('classifyAnthropicError: 529 → overage', () => {
+  assert.strictEqual(classifyAnthropicError(529, '', {}), 'overage');
+});
+
+test('classifyAnthropicError: 400 with out_of_usage error type → overage', () => {
+  const body = JSON.stringify({ error: { type: 'out_of_usage', message: 'You have run out of extra usage.' } });
+  assert.strictEqual(classifyAnthropicError(400, body, {}), 'overage');
+});
+
+test('classifyAnthropicError: 400 with quota_exceeded error type → overage', () => {
+  const body = JSON.stringify({ error: { type: 'quota_exceeded', message: 'Quota exceeded.' } });
+  assert.strictEqual(classifyAnthropicError(400, body, {}), 'overage');
+});
+
+test('classifyAnthropicError: 400 with "out of extra usage" in message → overage', () => {
+  const body = JSON.stringify({ error: { type: 'invalid_request_error', message: 'You are out of extra usage for this month.' } });
+  assert.strictEqual(classifyAnthropicError(400, body, {}), 'overage');
+});
+
+test('classifyAnthropicError: 400 with overage-status header disabled → overage', () => {
+  const body = JSON.stringify({ error: { type: 'invalid_request_error', message: 'Some other error.' } });
+  const headers = { 'anthropic-ratelimit-unified-overage-status': 'disabled' };
+  assert.strictEqual(classifyAnthropicError(400, body, headers), 'overage');
+});
+
+test('classifyAnthropicError: 400 generic bad request → malformed', () => {
+  const body = JSON.stringify({ error: { type: 'invalid_request_error', message: 'messages: field required' } });
+  assert.strictEqual(classifyAnthropicError(400, body, {}), 'malformed');
+});
+
+test('classifyAnthropicError: 400 with malformed JSON body → malformed', () => {
+  // Non-JSON body should still classify as malformed (not overage)
+  assert.strictEqual(classifyAnthropicError(400, 'not json', {}), 'malformed');
+});
+
+test('classifyAnthropicError: 500 → other', () => {
+  assert.strictEqual(classifyAnthropicError(500, '', {}), 'other');
+});
+
+test('classifyAnthropicError: 503 → other', () => {
+  assert.strictEqual(classifyAnthropicError(503, '', {}), 'other');
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────

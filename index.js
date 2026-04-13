@@ -22,7 +22,7 @@
  */
 
 const express = require('express');
-const { readFileSync, watchFile, unwatchFile } = require('fs');
+const { readFileSync, watchFile, unwatchFile, appendFileSync, existsSync, mkdirSync } = require('fs');
 const { homedir } = require('os');
 const { join } = require('path');
 const http = require('http');
@@ -32,6 +32,11 @@ const app = express();
 
 const PORT = parseInt(process.env.PORT || '4523', 10);
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+// Fallback event log: a JSONL file written whenever Anthropic overage/quota
+// errors occur or model fallback is likely. External watchers (Telegram bot,
+// cron, etc.) can tail this file for alerting.
+const FALLBACK_LOG_DIR = process.env.FALLBACK_LOG_DIR || join(homedir(), '.claude-max-proxy');
+const FALLBACK_LOG_PATH = join(FALLBACK_LOG_DIR, 'fallback-events.jsonl');
 const ANTHROPIC_BASE = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
 const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claude', '.credentials.json');
 // ANTHROPIC_TOKEN env var: bypass credentials file entirely — set to your sk-ant-oat01-* token directly.
@@ -54,6 +59,124 @@ function log(...args) {
 
 function debug(...args) {
   if (DEBUG) console.log(`[${new Date().toISOString()}] [DEBUG]`, ...args);
+}
+
+// ---------------------------------------------------------------------------
+// Fallback event logging
+// ---------------------------------------------------------------------------
+//
+// Durable JSONL log of overage/quota failures and likely model-fallback events.
+// Written to ~/.claude-max-proxy/fallback-events.jsonl (configurable via
+// FALLBACK_LOG_DIR env var). Each line is a self-contained JSON object so the
+// file is safe to tail and parse incrementally.
+//
+// Event types:
+//   overage          — Anthropic returned a 400/529 that looks like quota/overage
+//   malformed        — Anthropic returned a 400 that is a genuine request error
+//   model_fallback   — A request arrived for a "premium" model after recent
+//                      overage failures (client may have fallen back on its own)
+//   auth_failure     — Persistent 401 after token refresh
+//
+// Telegram alerts: the /fallback-events endpoint returns recent events as JSON
+// so the telegram-watchdog-trigger.js (or any cron) can poll and alert.
+// ---------------------------------------------------------------------------
+
+function ensureFallbackLogDir() {
+  if (!existsSync(FALLBACK_LOG_DIR)) {
+    try { mkdirSync(FALLBACK_LOG_DIR, { recursive: true, mode: 0o700 }); } catch {}
+  }
+}
+
+function logFallbackEvent(type, details = {}) {
+  const event = {
+    ts: new Date().toISOString(),
+    type,
+    ...details,
+  };
+  log(`[fallback-event] ${type}${details.model ? ` model=${details.model}` : ''}${details.reason ? ` reason=${details.reason}` : ''}`);
+  try {
+    ensureFallbackLogDir();
+    appendFileSync(FALLBACK_LOG_PATH, JSON.stringify(event) + '\n', { mode: 0o600 });
+  } catch (err) {
+    debug('[fallback-event] could not write to log:', err.message);
+  }
+}
+
+// Classify a non-2xx Anthropic response into one of:
+//   'overage'   — quota exhausted or plan-level restriction (soft, retrying won't help immediately)
+//   'malformed' — request was bad (hard error, caller bug)
+//   'auth'      — authentication failure
+//   'ratelimit' — transient rate limit
+//   'other'     — everything else
+//
+// Overage signals:
+//   • HTTP 400 with error.type = 'out_of_usage' OR error.type = 'quota_exceeded'
+//   • HTTP 400 with error.message containing 'out of extra usage' / 'over your usage limit'
+//   • HTTP 529 (overloaded/capacity)
+//   • anthropic-ratelimit-unified-overage-status header = 'disabled'
+function classifyAnthropicError(statusCode, body, headers = {}) {
+  if (statusCode === 401) return 'auth';
+  if (statusCode === 429) return 'ratelimit';
+
+  const overageStatus = (headers['anthropic-ratelimit-unified-overage-status'] || '').toLowerCase();
+  if (overageStatus === 'disabled') return 'overage';
+
+  if (statusCode === 529) return 'overage'; // service capacity exhausted
+
+  if (statusCode === 400) {
+    let parsed = null;
+    try { parsed = typeof body === 'string' ? JSON.parse(body) : body; } catch {}
+
+    const errType = (parsed?.error?.type || '').toLowerCase();
+    const errMsg  = (parsed?.error?.message || '').toLowerCase();
+
+    if (
+      errType === 'out_of_usage' ||
+      errType === 'quota_exceeded' ||
+      errType === 'usage_limit_exceeded' ||
+      errMsg.includes('out of extra usage') ||
+      errMsg.includes('over your usage limit') ||
+      errMsg.includes('quota') ||
+      errMsg.includes('usage limit')
+    ) {
+      return 'overage';
+    }
+    return 'malformed';
+  }
+
+  return 'other';
+}
+
+// Track recent overage events so we can detect client-side model fallback.
+// Stored as a ring buffer (max 20 entries) of { ts, model } objects.
+const recentOverageModels = [];
+const OVERAGE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
+function recordOverage(model) {
+  const now = Date.now();
+  recentOverageModels.push({ ts: now, model });
+  // Trim old entries and cap the buffer
+  while (recentOverageModels.length > 20) recentOverageModels.shift();
+}
+
+// Returns the set of models that had overage errors within the recent window.
+function recentOverageModelSet() {
+  const cutoff = Date.now() - OVERAGE_WINDOW_MS;
+  return new Set(recentOverageModels.filter(e => e.ts > cutoff).map(e => e.model));
+}
+
+// Called before each request to detect if the incoming model looks like a
+// fallback choice after recent overage failures on a different model.
+function checkModelFallback(incomingModel) {
+  const recentModels = recentOverageModelSet();
+  if (recentModels.size === 0) return;
+  if (recentModels.has(incomingModel)) return; // same model that had overage — not a fallback
+  // New model, different from the one(s) that had recent overages → likely fallback
+  logFallbackEvent('model_fallback', {
+    model: incomingModel,
+    priorOverageModels: [...recentModels],
+    detail: 'Client requested a different model shortly after overage failures on prior model(s)',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -791,10 +914,45 @@ function makeRequest(targetUrl, method, headers, payload) {
         let body = '';
         proxyRes.on('data', (d) => { body += d; });
         proxyRes.on('end', () => {
+          // Log the full 401 body + response headers — these contain the
+          // actual Anthropic error reason, not the generic "invalid x-api-key".
           let errMsg = '';
           try { errMsg = JSON.parse(body)?.error?.message || ''; } catch {}
           log(`[401] anthropic_says="${errMsg}"${wwwAuth ? ` www-authenticate="${wwwAuth}"` : ''}`);
-          resolve({ retry401: true, body });
+          log(`401 body: ${body.slice(0, 500)}`);
+          const interestingHeaders = ['x-request-id','request-id','anthropic-organization-id','x-should-retry','retry-after'];
+          for (const h of interestingHeaders) {
+            if (proxyRes.headers[h]) log(`401 header ${h}: ${proxyRes.headers[h]}`);
+          }
+          // Save the failing payload to a unique file so it survives subsequent
+          // requests overwriting the DEBUG snapshot.
+          if (DEBUG && payload) {
+            try {
+              const fs = require('fs');
+              const ts = Date.now();
+              const file = `/tmp/claude-proxy-401-${ts}.json`;
+              fs.writeFileSync(file, payload);
+              log(`401 payload saved to ${file}`);
+            } catch (e) { /* ignore */ }
+          }
+          resolve({ retry401: true, body, responseHeaders: proxyRes.headers });
+        });
+        return;
+      }
+      // For 400/529 and other 4xx/5xx errors, buffer the body so the caller
+      // can classify whether it is an overage error or a malformed-request
+      // error. This is done before streaming begins.
+      if (proxyRes.statusCode >= 400) {
+        let body = '';
+        proxyRes.on('data', (d) => { body += d; });
+        proxyRes.on('end', () => {
+          resolve({
+            retry: false,
+            errorBuffered: true,
+            statusCode: proxyRes.statusCode,
+            body,
+            responseHeaders: proxyRes.headers,
+          });
         });
         return;
       }
@@ -941,8 +1099,14 @@ function forwardRequest(req, res, body) {
           continue;
         }
 
-        // Exhausted all retries — trip the circuit breaker
+        // Exhausted all retries — trip the circuit breaker and log fallback event
         log(`[401] exhausted all retries — tripping circuit breaker (failure #${circuit.failures + 1})`);
+        log('401 persisted after token refresh — credentials may need re-login');
+        logFallbackEvent('auth_failure', {
+          model: 'unknown',
+          reason: '401 persisted after all retries',
+          detail: result.body?.slice(0, 200),
+        });
         circuitFailure();
         res.status(401).json(JSON.parse(result.body));
         return resolve();
@@ -962,15 +1126,66 @@ function forwardRequest(req, res, body) {
         return resolve();
       }
 
+      // Handle buffered error responses (400, 529, other 4xx/5xx)
+      if (result.errorBuffered) {
+        const sc = result.statusCode;
+        const errHeaders = result.responseHeaders || {};
+        const errBody = result.body;
+
+        const overageStatus = errHeaders['anthropic-ratelimit-unified-overage-status'] || '';
+        const overageReason = errHeaders['anthropic-ratelimit-unified-overage-disabled-reason'] || '';
+        const serviceTier  = errHeaders['anthropic-ratelimit-unified-tier'] || '';
+        const requestId    = errHeaders['x-request-id'] || errHeaders['request-id'] || '';
+
+        const errClass = classifyAnthropicError(sc, errBody, errHeaders);
+        const model = body?.model || 'unknown';
+
+        log(`← ERROR ${sc} [${errClass}] | model=${model} | overage=${overageStatus} | reason=${overageReason} | tier=${serviceTier}${requestId ? ' | reqid=' + requestId : ''}`);
+        log(`← ERROR body: ${errBody.slice(0, 300)}`);
+
+        if (errClass === 'overage') {
+          recordOverage(model);
+          logFallbackEvent('overage', {
+            model,
+            statusCode: sc,
+            overageStatus,
+            overageReason,
+            serviceTier,
+            requestId,
+            body: errBody.slice(0, 400),
+          });
+        } else if (errClass === 'malformed') {
+          logFallbackEvent('malformed', {
+            model,
+            statusCode: sc,
+            requestId,
+            body: errBody.slice(0, 400),
+          });
+        }
+
+        // Copy response headers to client
+        const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+        for (const [key, value] of Object.entries(errHeaders)) {
+          if (!skipHeaders.has(key.toLowerCase())) res.setHeader(key, value);
+        }
+        res.status(sc);
+
+        // Return the error body (desanitized if JSON)
+        try {
+          const parsed = JSON.parse(errBody);
+          const fixed = desanitizeResponseJson(parsed);
+          const out = JSON.stringify(fixed);
+          res.setHeader('content-length', Buffer.byteLength(out));
+          res.end(out);
+        } catch {
+          res.end(errBody);
+        }
+        return resolve();
+      }
+
       const { proxyRes } = result;
       const sc = proxyRes.statusCode;
-      if (sc >= 400) {
-        const overageStatus = proxyRes.headers['anthropic-ratelimit-unified-overage-status'] || '';
-        const overageReason = proxyRes.headers['anthropic-ratelimit-unified-overage-disabled-reason'] || '';
-        const serviceTier = proxyRes.headers['anthropic-ratelimit-unified-tier'] || '';
-        log(`← ERROR ${sc} | overage=${overageStatus} | reason=${overageReason} | tier=${serviceTier}`);
-      }
-      debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
+      debug(`← ${sc} ${proxyRes.statusMessage}`);
 
       // Copy response headers
       const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
@@ -979,7 +1194,7 @@ function forwardRequest(req, res, body) {
           res.setHeader(key, value);
         }
       }
-      res.status(proxyRes.statusCode);
+      res.status(sc);
 
       // Successful response — reset circuit breaker
       if (proxyRes.statusCode < 400) circuitSuccess();
@@ -1010,7 +1225,6 @@ function forwardRequest(req, res, body) {
         proxyRes.on('data', (chunk) => chunks.push(chunk));
         proxyRes.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf8');
-          if (sc >= 400) log(`← ERROR body: ${raw.slice(0, 300)}`);
           try {
             const parsed = JSON.parse(raw);
             const fixed = desanitizeResponseJson(parsed);
@@ -1046,6 +1260,10 @@ app.post('/v1/messages', async (req, res) => {
   const sanitizedBody = rewriteSystemForBillingClassifier(sanitizeRequest(req.body));
 
   const model = sanitizedBody.model || '?';
+
+  // Check if the incoming model looks like a client-side fallback after recent
+  // overage failures on a different model. Logs a 'model_fallback' event if so.
+  checkModelFallback(model);
   const stream = !!sanitizedBody.stream;
   const msgCount = sanitizedBody.messages?.length || 0;
 
@@ -1147,6 +1365,38 @@ app.get('/health', async (req, res) => {
   });
 });
 
+// GET /fallback-events — return recent fallback/overage events from the JSONL log.
+// Useful for polling from cron or the Telegram watchdog bot to alert on overages.
+// Query params:
+//   ?limit=N   — max number of events to return (default 20, max 200)
+//   ?type=X    — filter by event type (overage, malformed, model_fallback, auth_failure)
+//   ?since=ISO — only events at or after this ISO timestamp
+app.get('/fallback-events', (req, res) => {
+  try {
+    if (!existsSync(FALLBACK_LOG_PATH)) {
+      return res.json({ events: [], total: 0, logPath: FALLBACK_LOG_PATH });
+    }
+    const raw = readFileSync(FALLBACK_LOG_PATH, 'utf8');
+    const lines = raw.trim().split('\n').filter(Boolean);
+    let events = [];
+    for (const line of lines) {
+      try { events.push(JSON.parse(line)); } catch { /* skip malformed lines */ }
+    }
+    // Apply filters
+    const typeFilter = req.query.type;
+    const sinceFilter = req.query.since;
+    const limitFilter = Math.min(parseInt(req.query.limit || '20', 10), 200);
+    if (typeFilter) events = events.filter(e => e.type === typeFilter);
+    if (sinceFilter) events = events.filter(e => e.ts >= sinceFilter);
+    // Return most recent N
+    const total = events.length;
+    events = events.slice(-limitFilter);
+    res.json({ events, total, logPath: FALLBACK_LOG_PATH });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /force-refresh — force immediate token refresh regardless of expiry
 // Useful when Anthropic invalidates the token server-side before local expiry
 app.post('/force-refresh', async (req, res) => {
@@ -1208,5 +1458,13 @@ process.on('SIGINT', () => {
 
 // Exports for testing
 if (require.main !== module) {
-  module.exports = { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine };
+  module.exports = {
+    TOOL_RENAMES,
+    TOOL_RENAMES_REVERSE,
+    desanitizeResponseJson,
+    desanitizeSseLine,
+    classifyAnthropicError,
+    logFallbackEvent,
+    FALLBACK_LOG_PATH,
+  };
 }
