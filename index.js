@@ -32,6 +32,7 @@ const app = express();
 
 const PORT = parseInt(process.env.PORT || '4523', 10);
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+const MAX_RATE_LIMIT_WAIT_MS = parseInt(process.env.MAX_RATE_LIMIT_WAIT_MS || '120000', 10);
 // Fallback event log: a JSONL file written whenever Anthropic overage/quota
 // errors occur or model fallback is likely. External watchers (Telegram bot,
 // cron, etc.) can tail this file for alerting.
@@ -52,6 +53,11 @@ const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 const { randomUUID } = require('crypto');
 let PROXY_SESSION_ID = randomUUID();
+// Per-model rate-limit recovery tracking (keyed by model id)
+const perModelRateLimitRecovery = {}; // { [model]: { timer, at } }
+let rateLimitRecoveryTimer = null;
+let rateLimitRecoveryAt = 0;
+let rateLimitRecoveryModel = null;
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -59,6 +65,38 @@ function log(...args) {
 
 function debug(...args) {
   if (DEBUG) console.log(`[${new Date().toISOString()}] [DEBUG]`, ...args);
+}
+
+function scheduleRateLimitRecovery(details = {}) {
+  const retryAfterMs = Number(details.retryAfterMs || 0);
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs <= 0) return;
+
+  const nextRecoveryAt = Date.now() + retryAfterMs;
+  if (rateLimitRecoveryAt && nextRecoveryAt <= rateLimitRecoveryAt + 5000) {
+    debug(`[rate-limit-recovery] Existing recovery window kept (${new Date(rateLimitRecoveryAt).toISOString()})`);
+    return;
+  }
+
+  if (rateLimitRecoveryTimer) clearTimeout(rateLimitRecoveryTimer);
+  rateLimitRecoveryAt = nextRecoveryAt;
+  rateLimitRecoveryModel = details.model || rateLimitRecoveryModel || 'anthropic';
+
+  const delayMs = Math.max(nextRecoveryAt - Date.now(), 1000);
+  log(`[rate-limit-recovery] Scheduled for ${new Date(nextRecoveryAt).toISOString()} (${Math.round(delayMs / 60000)} min from now)`);
+
+  rateLimitRecoveryTimer = setTimeout(() => {
+    logFallbackEvent('rate_limit_cleared', {
+      model: rateLimitRecoveryModel || details.model || 'anthropic',
+      retryAfterMs,
+      availableAt: new Date(rateLimitRecoveryAt).toISOString(),
+      reason: 'anthropic_retry_window_elapsed',
+    });
+    rateLimitRecoveryTimer = null;
+    rateLimitRecoveryAt = 0;
+    rateLimitRecoveryModel = null;
+  }, delayMs);
+
+  rateLimitRecoveryTimer.unref?.();
 }
 
 // ---------------------------------------------------------------------------
@@ -803,10 +841,9 @@ const RETRY_BASE_MS = 2000;
 // ---------------------------------------------------------------------------
 // Circuit breaker — prevents hammering Anthropic when auth is broken.
 //
-// When Anthropic repeatedly rejects tokens, forwarding every incoming request
-// makes the outage longer. The circuit breaker stops forwarding after
-// THRESHOLD consecutive full failures, returns 503 immediately to clients,
-// then probes again after COOLDOWN_MS.
+// Per-model tracking: Opus and Sonnet have separate rate limit pools on
+// Claude Max. A global circuit would block Sonnet when only Opus is down.
+// The global circuit still exists for auth failures (401s) which affect all.
 //
 // States: closed (normal) → open (blocking) → half-open (one probe) → closed
 // ---------------------------------------------------------------------------
@@ -818,6 +855,65 @@ const circuit = {
   THRESHOLD: 3,
   COOLDOWN_MS: 60_000,
 };
+
+// Per-model rate-limit circuit (separate from auth circuit)
+// Keyed by model id. Trips after MODEL_RL_THRESHOLD consecutive rate-limit
+// deflections for that model, clears after MODEL_RL_COOLDOWN_MS.
+const modelCircuits = {};
+const MODEL_RL_THRESHOLD = 3;
+const MODEL_RL_COOLDOWN_MS = 120_000; // 2 minutes before probing again
+
+function getModelCircuit(model) {
+  if (!model) return null;
+  if (!modelCircuits[model]) {
+    modelCircuits[model] = { state: 'closed', failures: 0, openedAt: null };
+  }
+  return modelCircuits[model];
+}
+
+function modelCircuitAllow(model) {
+  const mc = getModelCircuit(model);
+  if (!mc || mc.state === 'closed') return { ok: true };
+  if (mc.state === 'open') {
+    const elapsed = Date.now() - mc.openedAt;
+    if (elapsed >= MODEL_RL_COOLDOWN_MS) {
+      mc.state = 'half-open';
+      log(`[model-circuit:${model}] half-open — probing after ${Math.round(elapsed / 1000)}s cooldown`);
+      return { ok: true };
+    }
+    return { ok: false, retryAfter: Math.ceil((MODEL_RL_COOLDOWN_MS - elapsed) / 1000) };
+  }
+  return { ok: true }; // half-open: allow probe
+}
+
+function modelCircuitSuccess(model) {
+  const mc = getModelCircuit(model);
+  if (!mc) return;
+  if (mc.state !== 'closed') log(`[model-circuit:${model}] closed — rate limit cleared`);
+  mc.state = 'closed';
+  mc.failures = 0;
+  mc.openedAt = null;
+}
+
+function modelCircuitRateLimit(model) {
+  const mc = getModelCircuit(model);
+  if (!mc) return;
+  mc.failures++;
+  if (mc.failures >= MODEL_RL_THRESHOLD) {
+    const wasOpen = mc.state === 'open';
+    mc.state = 'open';
+    mc.openedAt = Date.now();
+    if (!wasOpen) {
+      log(`[model-circuit:${model}] OPEN — ${mc.failures} consecutive rate limits, blocking for ${MODEL_RL_COOLDOWN_MS / 1000}s`);
+      logFallbackEvent('model_circuit_open', {
+        model,
+        failures: mc.failures,
+        cooldownMs: MODEL_RL_COOLDOWN_MS,
+        reason: 'consecutive_rate_limits',
+      });
+    }
+  }
+}
 
 function circuitAllow() {
   if (circuit.state === 'closed') return { ok: true };
@@ -905,7 +1001,13 @@ function makeRequest(targetUrl, method, headers, payload) {
         proxyRes.on('data', (d) => { body += d; });
         proxyRes.on('end', () => {
           const retryAfter = proxyRes.headers['retry-after'];
-          resolve({ retry: true, retryAfterMs: retryAfter ? parseInt(retryAfter) * 1000 : null, body });
+          resolve({
+            retry: true,
+            retryAfterMs: retryAfter ? parseInt(retryAfter) * 1000 : null,
+            body,
+            responseHeaders: proxyRes.headers,
+            statusCode: proxyRes.statusCode,
+          });
         });
         return;
       }
@@ -1000,7 +1102,7 @@ function desanitizeSseLine(line) {
 
 function forwardRequest(req, res, body) {
   return new Promise(async (resolve) => {
-    // Circuit breaker — reject immediately if auth is known-broken
+    // Global auth circuit breaker — reject immediately if auth is known-broken
     const circuitState = circuitAllow();
     if (!circuitState.ok) {
       log(`[circuit] open — rejecting request, retry after ${circuitState.retryAfter}s`);
@@ -1010,6 +1112,22 @@ function forwardRequest(req, res, body) {
         error: {
           type: 'circuit_open',
           message: `Auth temporarily unavailable — retrying in ${circuitState.retryAfter}s`,
+        },
+      });
+      return resolve();
+    }
+
+    // Per-model rate-limit circuit — lets Sonnet work when Opus is rate-limited
+    const requestModel = body?.model || null;
+    const modelCircuitState = modelCircuitAllow(requestModel);
+    if (!modelCircuitState.ok) {
+      log(`[model-circuit:${requestModel}] open — rejecting request, retry after ${modelCircuitState.retryAfter}s`);
+      res.set('Retry-After', String(modelCircuitState.retryAfter));
+      res.status(429).json({
+        type: 'error',
+        error: {
+          type: 'model_rate_limited',
+          message: `Model ${requestModel} is rate limited — try a fallback model or wait ${modelCircuitState.retryAfter}s`,
         },
       });
       return resolve();
@@ -1114,6 +1232,43 @@ function forwardRequest(req, res, body) {
 
       if (result.retry && attempt < MAX_RETRIES) {
         const delayMs = result.retryAfterMs || (RETRY_BASE_MS * Math.pow(2, attempt));
+        if (attempt === 0 || delayMs >= 300_000) {
+          logFallbackEvent('rate_limit', {
+            model: body?.model || 'unknown',
+            statusCode: 429,
+            attempt: attempt + 1,
+            retryAfterMs: delayMs,
+            reason: 'anthropic_429_retry',
+          });
+          scheduleRateLimitRecovery({
+            model: body?.model || 'unknown',
+            retryAfterMs: delayMs,
+          });
+        }
+        if (delayMs > MAX_RATE_LIMIT_WAIT_MS) {
+          log(`429 rate limited, retry-after ${delayMs}ms exceeds proxy cap ${MAX_RATE_LIMIT_WAIT_MS}ms; returning 429 so the client can fail over`);
+          logFallbackEvent('rate_limit', {
+            model: body?.model || 'unknown',
+            statusCode: result.statusCode || 429,
+            attempt: attempt + 1,
+            retryAfterMs: delayMs,
+            reason: 'anthropic_429_defer_to_client',
+          });
+          scheduleRateLimitRecovery({
+            model: body?.model || 'unknown',
+            retryAfterMs: delayMs,
+          });
+          // Trip the per-model circuit so subsequent requests for this model
+          // fail fast instead of hammering Anthropic with more 429s
+          modelCircuitRateLimit(requestModel);
+          const retryHeaders = result.responseHeaders || {};
+          const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+          for (const [key, value] of Object.entries(retryHeaders)) {
+            if (!skipHeaders.has(String(key).toLowerCase())) res.setHeader(key, value);
+          }
+          res.status(429).json(JSON.parse(result.body));
+          return resolve();
+        }
         log(`429 rate limited, retrying in ${delayMs}ms (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
         await new Promise(r => setTimeout(r, delayMs));
         continue;
@@ -1122,6 +1277,16 @@ function forwardRequest(req, res, body) {
       if (result.retry) {
         // Exhausted retries, return the 429
         log(`429 rate limited, exhausted ${MAX_RETRIES + 1} attempts`);
+        logFallbackEvent('rate_limit', {
+          model: body?.model || 'unknown',
+          statusCode: 429,
+          attempt: attempt + 1,
+          exhaustedRetries: true,
+          reason: 'anthropic_429_exhausted',
+          body: (result.body || '').slice(0, 400),
+        });
+        // Trip the per-model circuit — exhausted all retries
+        modelCircuitRateLimit(requestModel);
         res.status(429).json(JSON.parse(result.body));
         return resolve();
       }
@@ -1196,8 +1361,11 @@ function forwardRequest(req, res, body) {
       }
       res.status(sc);
 
-      // Successful response — reset circuit breaker
-      if (proxyRes.statusCode < 400) circuitSuccess();
+      // Successful response — reset both circuit breakers
+      if (proxyRes.statusCode < 400) {
+        circuitSuccess();
+        modelCircuitSuccess(requestModel);
+      }
 
       const contentType = proxyRes.headers['content-type'] || '';
       const isSSE = contentType.includes('text/event-stream');
@@ -1361,6 +1529,11 @@ app.get('/health', async (req, res) => {
     rateLimitTier: cachedCredentials?.rateLimitTier || 'unknown',
     circuit: circuit.state,
     ...(circuit.state !== 'closed' ? { circuitFailures: circuit.failures } : {}),
+    modelCircuits: Object.fromEntries(
+      Object.entries(modelCircuits)
+        .filter(([, mc]) => mc.state !== 'closed')
+        .map(([model, mc]) => [model, { state: mc.state, failures: mc.failures }])
+    ),
     ...(isMax ? {} : { warning: 'Not a Max subscription — requests will be billed as standard API usage' }),
   });
 });

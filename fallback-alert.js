@@ -52,6 +52,29 @@ if (!BOT_TOKEN) {
 let lastFileSize = 0;
 const lastAlertTime = {}; // type -> timestamp
 
+// Edge-triggered state: track current degraded conditions so we only alert on transition
+// degradedState[key] = true means we've already alerted and are in degraded state
+// Persisted to disk so restarts don't cause re-alerts
+const STATE_FILE = join(homedir(), '.claude-max-proxy', 'alert-state.json');
+
+function loadAlertState() {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveAlertState(state) {
+  try {
+    require('fs').writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    console.error(`[fallback-alert] Failed to save alert state: ${err.message}`);
+  }
+}
+
+let alertState = loadAlertState(); // { 'rate_limit:claude-opus-4-6': true, ... }
+
 // --- Telegram ---
 function sendTelegramAlert(text) {
   const payload = JSON.stringify({
@@ -97,9 +120,11 @@ const EVENT_EMOJI = {
   model_fallback: '⚠️',
   malformed: '🟡',
   rate_limit: '🟠',
+  rate_limit_cleared: '🟢',
+  model_circuit_open: '🚫',
 };
 
-const ALERT_EVENTS = new Set(['overage', 'auth_failure', 'model_fallback']);
+const ALERT_EVENTS = new Set(['overage', 'auth_failure', 'model_fallback', 'rate_limit', 'rate_limit_cleared', 'model_circuit_open']);
 
 function formatEvent(event) {
   const emoji = EVENT_EMOJI[event.type] || '❓';
@@ -123,12 +148,38 @@ function formatEvent(event) {
         `Token refresh failed after retries.\n` +
         `Fix: Check ~/.claude/.credentials.json or re-auth Claude CLI`;
 
+    case 'rate_limit': {
+      const retryAfterMs = Number(event.retryAfterMs || 0);
+      const retryAfterMin = retryAfterMs > 0 ? Math.round(retryAfterMs / 60000) : null;
+      return `${emoji} <b>Anthropic rate limited</b>\n` +
+        `Time: ${time} ET\n` +
+        `Model: ${event.model || 'unknown'}\n` +
+        `Attempt: ${event.attempt || 'unknown'}\n` +
+        `${retryAfterMin ? `Retry after: ~${retryAfterMin} min\n` : ''}` +
+        `${event.exhaustedRetries ? 'Retries exhausted.\n' : ''}` +
+        `Work should continue on fallback. I'll tell you when Anthropic is back.`;
+    }
+
+    case 'rate_limit_cleared': {
+      return `${emoji} <b>Anthropic retry window elapsed</b>\n` +
+        `Time: ${time} ET\n` +
+        `Model: ${event.model || 'unknown'}\n` +
+        `Anthropic should be available again now.`;
+    }
+
     case 'model_fallback':
       return `${emoji} <b>Model fallback detected</b>\n` +
         `Time: ${time} ET\n` +
         `From: ${event.expected_model || 'Opus'} → ${event.model || 'unknown'}\n` +
         `Reason: ${event.reason || 'upstream failure'}\n` +
         `Sessions may be on wrong model!`;
+
+    case 'model_circuit_open':
+      return `${emoji} <b>Model circuit tripped: ${event.model || 'unknown'}</b>\n` +
+        `Time: ${time} ET\n` +
+        `Reason: ${event.failures || '?'} consecutive rate limits\n` +
+        `This model will fail fast for ~${Math.round((event.cooldownMs || 120000) / 60000)} min, then probe.\n` +
+        `Other models (e.g. Sonnet/Codex) are unaffected.`;
 
     default:
       return `${emoji} <b>Proxy event: ${event.type}</b>\n` +
@@ -167,7 +218,36 @@ function processNewLines() {
         // Only alert on critical events
         if (!ALERT_EVENTS.has(event.type)) continue;
 
-        // Cooldown check
+        // Edge-triggered logic for rate_limit / rate_limit_cleared
+        if (event.type === 'rate_limit') {
+          const stateKey = `rate_limit:${event.model || 'unknown'}`;
+          if (alertState[stateKey]) {
+            // Already alerted for this model being rate limited — stay silent
+            console.log(`[fallback-alert] Suppressed repeat rate_limit for ${event.model} (already in degraded state)`);
+            continue;
+          }
+          // First time seeing this — transition INTO degraded state
+          alertState[stateKey] = true;
+          saveAlertState(alertState);
+          sendTelegramAlert(formatEvent(event));
+          continue;
+        }
+
+        if (event.type === 'rate_limit_cleared') {
+          const stateKey = `rate_limit:${event.model || 'unknown'}`;
+          if (!alertState[stateKey]) {
+            // Not in degraded state — don't fire spurious recovery alert
+            console.log(`[fallback-alert] Suppressed rate_limit_cleared for ${event.model} (not in degraded state)`);
+            continue;
+          }
+          // Transition OUT of degraded state
+          delete alertState[stateKey];
+          saveAlertState(alertState);
+          sendTelegramAlert(formatEvent(event));
+          continue;
+        }
+
+        // For other event types (overage, auth_failure, model_fallback): cooldown only
         const now = Date.now();
         const lastAlert = lastAlertTime[event.type] || 0;
         if (now - lastAlert < COOLDOWN_MS) {
