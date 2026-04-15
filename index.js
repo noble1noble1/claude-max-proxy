@@ -32,7 +32,7 @@ const app = express();
 
 const PORT = parseInt(process.env.PORT || '4523', 10);
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
-const MAX_RATE_LIMIT_WAIT_MS = parseInt(process.env.MAX_RATE_LIMIT_WAIT_MS || '120000', 10);
+const MAX_RATE_LIMIT_WAIT_MS = parseInt(process.env.MAX_RATE_LIMIT_WAIT_MS || '0', 10); // 0 = always defer to client immediately on 429
 // Fallback event log: a JSONL file written whenever Anthropic overage/quota
 // errors occur or model fallback is likely. External watchers (Telegram bot,
 // cron, etc.) can tail this file for alerting.
@@ -43,6 +43,11 @@ const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claud
 // ANTHROPIC_TOKEN env var: bypass credentials file entirely — set to your sk-ant-oat01-* token directly.
 // Useful when Claude Code stores credentials in macOS Keychain instead of ~/.claude/.credentials.json.
 const ANTHROPIC_TOKEN_OVERRIDE = process.env.ANTHROPIC_TOKEN || null;
+// CREDENTIALS_PATH_FALLBACK: path to a second account's credentials file.
+// When the primary account hits an overage/quota error, the proxy automatically
+// switches to the fallback account for the remainder of that request (and future
+// requests until the process restarts or the primary account quota resets).
+const CREDENTIALS_PATH_FALLBACK = process.env.CREDENTIALS_PATH_FALLBACK || null;
 // AUTH_HEADER_FORMAT: 'bearer' (default) or 'x-api-key'.
 // OAuth tokens (sk-ant-oat01-*) require Authorization: Bearer — sending them as x-api-key
 // causes "invalid x-api-key" 401s. Override with AUTH_HEADER_FORMAT=x-api-key only if
@@ -224,6 +229,74 @@ function checkModelFallback(incomingModel) {
 let cachedCredentials = null;
 let refreshInProgress = null;
 
+// ---------------------------------------------------------------------------
+// Multi-account fallback state
+// ---------------------------------------------------------------------------
+let cachedFallbackCredentials = null;
+let fallbackRefreshInProgress = null;
+let usingFallbackAccount = false; // flips to true on primary overage
+
+function readFallbackCredentials() {
+  if (!CREDENTIALS_PATH_FALLBACK) return null;
+  try {
+    const raw = readFileSync(CREDENTIALS_PATH_FALLBACK, 'utf-8');
+    const parsed = JSON.parse(raw);
+    cachedFallbackCredentials = parsed.claudeAiOauth;
+    if (!cachedFallbackCredentials?.accessToken) throw new Error('No accessToken');
+    debug('[fallback-account] Fallback credentials loaded from', CREDENTIALS_PATH_FALLBACK);
+    return cachedFallbackCredentials;
+  } catch (err) {
+    debug('[fallback-account] Could not read fallback credentials:', err.message);
+    return null;
+  }
+}
+
+async function getFallbackAccessToken() {
+  if (!cachedFallbackCredentials) readFallbackCredentials();
+  if (!cachedFallbackCredentials) throw new Error('No fallback credentials available');
+
+  if (!isTokenExpired(cachedFallbackCredentials)) return cachedFallbackCredentials.accessToken;
+
+  // Refresh the fallback token
+  if (!fallbackRefreshInProgress) {
+    fallbackRefreshInProgress = (async () => {
+      if (!cachedFallbackCredentials?.refreshToken) throw new Error('No fallback refresh token');
+      log('[fallback-account] Refreshing fallback OAuth token...');
+      const body = JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: cachedFallbackCredentials.refreshToken,
+        client_id: OAUTH_CLIENT_ID,
+        scope: OAUTH_SCOPES,
+      });
+      const res = await fetch(OAUTH_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => res.statusText);
+        throw new Error(`Fallback token refresh failed (${res.status}): ${errText}`);
+      }
+      const data = await res.json();
+      cachedFallbackCredentials = {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token || cachedFallbackCredentials.refreshToken,
+        expiresAt: Date.now() + data.expires_in * 1000,
+        scopes: (data.scope || OAUTH_SCOPES).split(' '),
+      };
+      try {
+        const { writeFileSync } = require('fs');
+        writeFileSync(CREDENTIALS_PATH_FALLBACK, JSON.stringify({ claudeAiOauth: cachedFallbackCredentials }, null, 2), { mode: 0o600 });
+      } catch {}
+      log('[fallback-account] Fallback token refreshed, expires at', new Date(cachedFallbackCredentials.expiresAt).toISOString());
+      return cachedFallbackCredentials;
+    })().finally(() => { fallbackRefreshInProgress = null; });
+  }
+  const refreshed = await fallbackRefreshInProgress;
+  return refreshed.accessToken;
+}
+
 // Read token from macOS Keychain — fallback for Claude Code 2.1.92+ which may
 // migrate credentials away from ~/.claude/.credentials.json on some machines.
 function readCredentialsFromKeychain() {
@@ -355,6 +428,11 @@ async function refreshToken(creds) {
 }
 
 async function getAccessToken() {
+  // If primary account hit overage, route all subsequent requests through fallback
+  if (usingFallbackAccount && CREDENTIALS_PATH_FALLBACK) {
+    return getFallbackAccessToken();
+  }
+
   if (!cachedCredentials) {
     readCredentials();
   }
@@ -835,7 +913,7 @@ function rewriteSystemForBillingClassifier(body) {
 // Reverse proxy: forward to api.anthropic.com
 // ---------------------------------------------------------------------------
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 0; // Never retry 429s — fail fast and let myapp handle fallback
 const RETRY_BASE_MS = 2000;
 
 // ---------------------------------------------------------------------------
@@ -1319,6 +1397,28 @@ function forwardRequest(req, res, body) {
             requestId,
             body: errBody.slice(0, 400),
           });
+
+          // Multi-account fallback: if primary account just hit overage and a
+          // fallback credentials file is configured, switch accounts and retry.
+          if (!usingFallbackAccount && CREDENTIALS_PATH_FALLBACK) {
+            const fallbackCreds = readFallbackCredentials();
+            if (fallbackCreds) {
+              log('[account-fallback] Primary account quota exhausted — switching to fallback account and retrying');
+              logFallbackEvent('account_switch', { model, reason: 'primary_overage', to: 'fallback' });
+              usingFallbackAccount = true;
+              try {
+                accessToken = await getFallbackAccessToken();
+                headers = buildHeaders(accessToken, req);
+                if (payload) headers['content-length'] = Buffer.byteLength(payload);
+                PROXY_SESSION_ID = randomUUID();
+                log(`[account-fallback] Retrying with fallback account token=${accessToken.slice(0, 15)}...`);
+                continue; // retry the request with fallback credentials
+              } catch (fallbackErr) {
+                log(`[account-fallback] Failed to get fallback token: ${fallbackErr.message}`);
+                usingFallbackAccount = false; // revert; will fall through to error response
+              }
+            }
+          }
         } else if (errClass === 'malformed') {
           logFallbackEvent('malformed', {
             model,
@@ -1452,7 +1552,7 @@ app.post('/v1/messages', async (req, res) => {
   log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount} | tools=${toolCount} | thinking=${hasThinking} | sys=${sysInfo}`);
 
   // For large sessions, dump the full request body to a temp file for debugging
-  if (msgCount >= 15) {
+  if (msgCount >= 15 && process.env.PROXY_DEBUG_DUMPS === 'true') {
     const dumpPath = `/tmp/claude-proxy-dump-${Date.now()}.json`;
     require('fs').writeFileSync(dumpPath, JSON.stringify(sanitizedBody, null, 2));
     log(`  Dumped large request body to ${dumpPath}`);
@@ -1601,6 +1701,7 @@ app.post('/force-refresh', async (req, res) => {
 // Load credentials on startup and schedule proactive refresh
 readCredentials();
 scheduleProactiveRefresh();
+if (CREDENTIALS_PATH_FALLBACK) readFallbackCredentials();
 
 app.listen(PORT, '127.0.0.1', () => {
   log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
