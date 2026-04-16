@@ -747,9 +747,39 @@ function makeRequest(targetUrl, method, headers, payload) {
   });
 }
 
-// Restore renamed tool names in a parsed JSON response object (non-streaming).
-// Anthropic echoes back the tool names we sent — we need to reverse them so
-// OpenClaw receives the original names it registered.
+// Reverse sanitized strings in response text. The model sees sanitized
+// terms in context (STATUS_ACK, SKIP_MSG, STATUSCHECK.md, etc.) and
+// echoes them in its output. Without reversal, OpenClaw gets literal
+// "SKIP_MSG" text and posts it to chat instead of treating it as a
+// silent-reply sentinel. These patterns are the exact inverse of
+// SANITIZE_PATTERNS + SYSTEM_ONLY_PATTERNS applied to outgoing requests.
+const RESPONSE_DESANITIZE_PATTERNS = [
+  // System-only patterns (most common in assistant output)
+  [/STATUS_ACK/g, 'HEARTBEAT_OK'],
+  [/STATUSCHECK\.md/g, 'HEARTBEAT.md'],
+  [/STATUS_CHECK/g, 'HEARTBEAT'],
+  [/SKIP_MSG/g, 'NO_REPLY'],
+  [/PERSONA\.md/g, 'SOUL.md'],
+  // Paths — reverse .clawdata back to .openclaw
+  [/\.clawdata\//g, '.openclaw/'],
+  [/\/clawdata\//g, '/openclaw/'],
+  // App name
+  [/MyApp/g, 'OpenClaw'],
+];
+
+function desanitizeResponseString(text) {
+  if (typeof text !== 'string') return text;
+  for (const [pattern, replacement] of RESPONSE_DESANITIZE_PATTERNS) {
+    text = text.replace(pattern, replacement);
+  }
+  return text;
+}
+
+// Restore renamed tool names AND sanitized strings in a parsed JSON response.
+// Text content and tool_use inputs may contain sanitized terms (SKIP_MSG,
+// STATUSCHECK.md, etc.) that the model echoed from its context — these need
+// to be reversed before the client sees them. Other string fields (ids,
+// error messages) are left alone.
 function desanitizeResponseJson(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(desanitizeResponseJson);
@@ -758,6 +788,12 @@ function desanitizeResponseJson(obj) {
   for (const [k, v] of Object.entries(obj)) {
     if (k === 'name' && typeof v === 'string' && TOOL_RENAMES_REVERSE[v]) {
       result[k] = TOOL_RENAMES_REVERSE[v];
+    } else if ((k === 'text' || k === 'thinking' || k === 'content') && typeof v === 'string') {
+      // Assistant text output, thinking blocks, or tool_result content
+      result[k] = desanitizeResponseString(v);
+    } else if (k === 'input' && typeof v === 'object' && v !== null) {
+      // Tool use inputs — model may reference sanitized paths/names in arguments
+      result[k] = JSON.parse(desanitizeResponseString(JSON.stringify(v)));
     } else if (typeof v === 'object' && v !== null) {
       result[k] = desanitizeResponseJson(v);
     } else {
